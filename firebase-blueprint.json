@@ -1,0 +1,75 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Student user profile on Campus Connect",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 100 },
+        "email": { "type": "string", "maxLength": 150 },
+        "branch": { "type": "string", "maxLength": 100 },
+        "year": { "type": "string", "maxLength": 50 },
+        "bio": { "type": "string", "maxLength": 1000 },
+        "skills": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 50 }
+        },
+        "avatarUrl": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "name", "email", "branch", "year", "skills"]
+    },
+    "Connection": {
+      "title": "Connection",
+      "description": "Student networking connection request or active relationship",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "requesterId": { "type": "string", "maxLength": 128 },
+        "recipientId": { "type": "string", "maxLength": 128 },
+        "requesterName": { "type": "string", "maxLength": 100 },
+        "recipientName": { "type": "string", "maxLength": 100 },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "accepted", "rejected"]
+        },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["requesterId", "recipientId", "status"]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "Direct one-to-one chat message between students",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "from": { "type": "string", "maxLength": 128 },
+        "to": { "type": "string", "maxLength": 128 },
+        "participants": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 128 }
+        },
+        "text": { "type": "string", "maxLength": 2000 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["from", "to", "participants", "text"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Stores student user profiles"
+    },
+    "/connections/{connectionId}": {
+      "schema": "Connection",
+      "description": "Stores networking connection requests between students"
+    },
+    "/messages/{messageId}": {
+      "schema": "Message",
+      "description": "Stores private one-to-one messages"
+    }
+  }
+}

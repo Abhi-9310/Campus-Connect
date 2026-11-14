@@ -1,0 +1,72 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Student Profiles
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn()
+        && request.auth.uid == userId
+        && incoming().uid == userId
+        && incoming().name is string
+        && incoming().name.size() > 0
+        && incoming().name.size() <= 100;
+      allow update: if isSignedIn()
+        && request.auth.uid == userId
+        && incoming().uid == userId;
+      allow delete: if false;
+    }
+
+    // Networking Connections
+    match /connections/{connectionId} {
+      allow read: if isSignedIn()
+        && (resource.data.requesterId == request.auth.uid || resource.data.recipientId == request.auth.uid);
+      allow create: if isSignedIn()
+        && incoming().requesterId == request.auth.uid
+        && incoming().recipientId != request.auth.uid
+        && incoming().status in ['pending', 'accepted'];
+      allow update: if isSignedIn()
+        && (resource.data.recipientId == request.auth.uid || resource.data.requesterId == request.auth.uid)
+        && incoming().status in ['pending', 'accepted', 'rejected'];
+      allow delete: if isSignedIn()
+        && (resource.data.recipientId == request.auth.uid || resource.data.requesterId == request.auth.uid);
+    }
+
+    // Direct Messages
+    match /messages/{messageId} {
+      allow read: if isSignedIn()
+        && request.auth.uid in resource.data.participants;
+      allow create: if isSignedIn()
+        && incoming().from == request.auth.uid
+        && request.auth.uid in incoming().participants
+        && incoming().participants.size() == 2
+        && incoming().text is string
+        && incoming().text.size() > 0
+        && incoming().text.size() <= 2000;
+      allow update: if false;
+      allow delete: if isSignedIn() && resource.data.from == request.auth.uid;
+    }
+  }
+}

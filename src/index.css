@@ -1,0 +1,64 @@
+@import "tailwindcss";
+
+:root {
+  --primary-navy: #0F1B3D;
+  --secondary-navy: #18284F;
+  --accent-yellow: #FFC93C;
+  --accent-coral: #FF6B5B;
+  --bg-main: #F5F6FA;
+  --bg-card: #FFFFFF;
+  --text-primary: #18233F;
+  --text-secondary: #747D91;
+  --border-color: #E7EAF0;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: var(--bg-main);
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* Custom button and card utilities */
+.bg-navy-primary {
+  background-color: var(--primary-navy);
+}
+
+.bg-navy-secondary {
+  background-color: var(--secondary-navy);
+}
+
+.text-navy-primary {
+  color: var(--primary-navy);
+}
+
+.bg-accent-yellow {
+  background-color: var(--accent-yellow);
+}
+
+.text-accent-yellow {
+  color: var(--accent-yellow);
+}
+
+.border-brand {
+  border-color: var(--border-color);
+}

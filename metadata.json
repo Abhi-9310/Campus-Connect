@@ -1,0 +1,6 @@
+{
+  "name": "Campus Connect",
+  "description": "Full-stack student networking and communication platform connecting students by technical skills, branches, and interests.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
