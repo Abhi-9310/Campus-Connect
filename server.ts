@@ -12,10 +12,26 @@ import { createServer as createViteServer } from 'vite';
 const app = express();
 const httpServer = http.createServer(app);
 const isProd = process.env.NODE_ENV === 'production';
-const PORT = 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'campus_connect_jwt_secret_2026';
+const PORT = Number(process.env.PORT) || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || (isProd ? '' : 'campus_connect_local_dev_secret');
 
-app.use(cors());
+if (isProd && !JWT_SECRET) {
+  throw new Error('JWT_SECRET must be configured in the production environment.');
+}
+
+const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:3000')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('Origin not allowed by CORS'));
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 
 // Persistent Data Storage Paths
@@ -849,10 +865,9 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    console.log('[Server] Starting in production mode serving dist...');
-    app.use(express.static(path.resolve(process.cwd(), 'dist')));
-    app.get('*', (req, res) => {
-      res.sendFile(path.resolve(process.cwd(), 'dist', 'index.html'));
+    console.log('[Server] Starting API and Socket.IO in production mode...');
+    app.use((req, res) => {
+      res.status(404).json({ error: 'API route not found' });
     });
   }
 
