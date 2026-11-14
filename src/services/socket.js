@@ -1,5 +1,8 @@
 import { io } from 'socket.io-client';
 
+const API_BASE_URL = (import.meta.env.VITE_API_URL || '').replace(/\\/$/, '');
+const apiUrl = (path) => `${API_BASE_URL}${path}`;
+
 let socket = null;
 let currentToken = null;
 const messageListeners = new Set();
@@ -23,7 +26,7 @@ export async function getAuthToken(user) {
   }
 
   try {
-    const res = await fetch('/api/auth/token', {
+    const res = await fetch(apiUrl('/api/auth/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -73,7 +76,7 @@ export async function initSocket(user) {
 
   currentToken = token;
 
-  socket = io(window.location.origin, {
+  socket = io(API_BASE_URL || window.location.origin, {
     auth: { token },
     transports: ['polling', 'websocket'],
     reconnection: true,
@@ -178,7 +181,7 @@ export function sendSocketMessage(to, text, tempId) {
  */
 export async function sendRestMessage(to, text) {
   if (!currentToken) return null;
-  const res = await fetch(`/api/messages/${to}`, {
+  const res = await fetch(apiUrl(`/api/messages/${to}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -202,7 +205,7 @@ export async function fetchConversationHistory(targetUserId, user) {
   if (!token) return [];
 
   try {
-    const res = await fetch(`/api/messages/${targetUserId}`, {
+    const res = await fetch(apiUrl(`/api/messages/${targetUserId}`, {
       headers: {
         'Authorization': `Bearer ${token}`
       }
@@ -223,7 +226,7 @@ export async function fetchConversationHistory(targetUserId, user) {
  * Register account with Express backend
  */
 export async function apiRegister(payload) {
-  const res = await fetch('/api/auth/register', {
+  const res = await fetch(apiUrl('/api/auth/register', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
@@ -246,7 +249,7 @@ export async function apiRegister(payload) {
  * Login with email and password with Express backend
  */
 export async function apiLogin(email, password) {
-  const res = await fetch('/api/auth/login', {
+  const res = await fetch(apiUrl('/api/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, password })
@@ -276,7 +279,7 @@ export async function apiFetchUsers(user) {
   }
 
   try {
-    const res = await fetch('/api/users', { headers });
+    const res = await fetch(apiUrl('/api/users', { headers });
     if (!res.ok) throw new Error('Failed to fetch users');
     return await res.json();
   } catch (err) {
@@ -293,7 +296,7 @@ export async function apiFetchConnections(user) {
   if (!token) return [];
 
   try {
-    const res = await fetch('/api/connections', {
+    const res = await fetch(apiUrl('/api/connections', {
       headers: { 'Authorization': `Bearer ${token}` }
     });
     if (!res.ok) throw new Error('Failed to fetch connections');
@@ -311,7 +314,7 @@ export async function apiSendConnection(targetUserId, user) {
   const token = currentToken || await getAuthToken(user);
   if (!token) return null;
 
-  const res = await fetch(`/api/connections/${targetUserId}`, {
+  const res = await fetch(apiUrl(`/api/connections/${targetUserId}`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -332,7 +335,7 @@ export async function apiUpdateConnection(requestId, status, user) {
   const token = currentToken || await getAuthToken(user);
   if (!token) return null;
 
-  const res = await fetch(`/api/connections/${requestId}`, {
+  const res = await fetch(apiUrl(`/api/connections/${requestId}`, {
     method: 'PUT',
     headers: {
       'Content-Type': 'application/json',
@@ -354,7 +357,7 @@ export async function apiDeleteConnection(requestId, user) {
   const token = currentToken || await getAuthToken(user);
   if (!token) return null;
 
-  const res = await fetch(`/api/connections/${requestId}`, {
+  const res = await fetch(apiUrl(`/api/connections/${requestId}`, {
     method: 'DELETE',
     headers: { 'Authorization': `Bearer ${token}` }
   });
@@ -372,7 +375,7 @@ export async function apiUpdateProfile(updatedData, user) {
   const token = currentToken || await getAuthToken(user);
   if (!token) return null;
 
-  const res = await fetch('/api/users/me', {
+  const res = await fetch(apiUrl('/api/users/me', {
     method: 'PUT',
     headers: {
       'Content-Type': 'application/json',
@@ -419,7 +422,7 @@ export async function apiFetchNotifications(user) {
   if (!token) return [];
 
   try {
-    const res = await fetch('/api/notifications', {
+    const res = await fetch(apiUrl('/api/notifications', {
       headers: { 'Authorization': `Bearer ${token}` }
     });
     if (!res.ok) throw new Error('Failed to fetch notifications');
@@ -438,7 +441,7 @@ export async function apiMarkNotificationRead(notificationId, user) {
   if (!token) return null;
 
   try {
-    const res = await fetch(`/api/notifications/${notificationId}/read`, {
+    const res = await fetch(apiUrl(`/api/notifications/${notificationId}/read`, {
       method: 'PATCH',
       headers: { 'Authorization': `Bearer ${token}` }
     });
@@ -458,7 +461,7 @@ export async function apiMarkAllNotificationsRead(user) {
   if (!token) return null;
 
   try {
-    const res = await fetch('/api/notifications/read-all', {
+    const res = await fetch(apiUrl('/api/notifications/read-all', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}` }
     });
@@ -504,7 +507,7 @@ export async function apiUploadAvatar(file, user) {
   const formData = new FormData();
   formData.append('avatar', file);
 
-  const res = await fetch('/api/users/me/avatar', {
+  const res = await fetch(apiUrl('/api/users/me/avatar', {
     method: 'POST',
     headers: {
       'Authorization': `Bearer ${token}`
@@ -526,7 +529,7 @@ export async function apiRemoveAvatar(user) {
   const token = currentToken || await getAuthToken(user);
   if (!token) throw new Error('Authentication required');
 
-  const res = await fetch('/api/users/me/avatar', {
+  const res = await fetch(apiUrl('/api/users/me/avatar', {
     method: 'DELETE',
     headers: {
       'Authorization': `Bearer ${token}`
