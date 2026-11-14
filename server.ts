@@ -486,7 +486,7 @@ const avatarUpload = multer({
   }
 });
 
-function uploadAvatar(buffer: Buffer, userId: string): Promise<{ url: string; publicId: string }> {
+function configureCloudinary() {
   if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
     throw new Error('Cloudinary environment variables are not configured.');
   }
@@ -496,6 +496,10 @@ function uploadAvatar(buffer: Buffer, userId: string): Promise<{ url: string; pu
     api_secret: process.env.CLOUDINARY_API_SECRET,
     secure: true
   });
+}
+
+function uploadAvatar(buffer: Buffer, userId: string): Promise<{ url: string; publicId: string }> {
+  configureCloudinary();
   return new Promise((resolve, reject) => {
     const stream = cloudinary.uploader.upload_stream(
       { folder: 'campus-connect/avatars', public_id: `${userId}_${Date.now()}`, resource_type: 'image' },
@@ -547,7 +551,14 @@ app.delete('/api/users/me/avatar', requireAuth, async (req: Request, res: Respon
   const userIndex = usersCache.findIndex(u => u.uid === userId);
   if (userIndex === -1) return res.status(404).json({ error: 'Student account not found' });
   const oldPublicId = usersCache[userIndex].avatarPublicId;
-  if (oldPublicId) await cloudinary.uploader.destroy(oldPublicId).catch(() => null);
+  if (oldPublicId) {
+    try {
+      configureCloudinary();
+      await cloudinary.uploader.destroy(oldPublicId);
+    } catch (error) {
+      console.warn('[Avatar Remove] Cloudinary cleanup failed:', error);
+    }
+  }
   usersCache[userIndex].avatarUrl = '';
   usersCache[userIndex].avatarPublicId = '';
   await saveRecord('users', 'uid', usersCache[userIndex]);
