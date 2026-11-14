@@ -7,6 +7,7 @@ import fs from 'fs';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import multer from 'multer';
+import { MongoClient } from 'mongodb';
 import { createServer as createViteServer } from 'vite';
 
 const app = express();
@@ -34,125 +35,47 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Persistent Data Storage Paths
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-const UPLOADS_DIR = path.resolve(process.cwd(), 'uploads');
-const MESSAGES_FILE = path.join(DATA_DIR, 'messages.json');
-const USERS_FILE = path.join(DATA_DIR, 'users.json');
-const CONNECTIONS_FILE = path.join(DATA_DIR, 'connections.json');
-const NOTIFICATIONS_FILE = path.join(DATA_DIR, 'notifications.json');
-
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+// MongoDB persistence. Caches are loaded at startup and each mutation is written to MongoDB.
+let mongoDb: import('mongodb').Db;
+async function connectDatabase() {
+  const uri = process.env.MONGODB_URI;
+  if (!uri) throw new Error('MONGODB_URI must be configured.');
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 10000 });
+  await client.connect();
+  mongoDb = client.db();
+  await Promise.all([
+    mongoDb.collection('users').createIndex({ uid: 1 }, { unique: true }),
+    mongoDb.collection('users').createIndex({ email: 1 }, { unique: true }),
+    mongoDb.collection('connections').createIndex({ id: 1 }, { unique: true }),
+    mongoDb.collection('messages').createIndex({ id: 1 }, { unique: true }),
+    mongoDb.collection('messages').createIndex({ participants: 1, createdAt: -1 }),
+    mongoDb.collection('notifications').createIndex({ id: 1 }, { unique: true }),
+    mongoDb.collection('notifications').createIndex({ recipientId: 1, createdAt: -1 })
+  ]);
+  usersCache = await mongoDb.collection('users').find({}, { projection: { _id: 0 } }).toArray() as User[];
+  connectionsCache = await mongoDb.collection('connections').find({}, { projection: { _id: 0 } }).toArray() as Connection[];
+  messagesCache = await mongoDb.collection('messages').find({}, { projection: { _id: 0 } }).toArray() as Message[];
+  notificationsCache = await mongoDb.collection('notifications').find({}, { projection: { _id: 0 } }).toArray() as Notification[];
+  console.log(`[MongoDB] Connected. Loaded ${usersCache.length} users, ${connectionsCache.length} connections, ${messagesCache.length} messages and ${notificationsCache.length} notifications.`);
 }
-
-if (!fs.existsSync(UPLOADS_DIR)) {
-  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+async function saveRecord<T extends Record<string, any>>(collectionName: string, key: string, record: T) {
+  if (!mongoDb) throw new Error('MongoDB is not connected.');
+  const { _id, ...document } = record as T & { _id?: unknown };
+  await mongoDb.collection(collectionName).updateOne({ [key]: document[key] }, { $set: document }, { upsert: true });
 }
-
-// Statically serve uploaded profile images
-app.use('/uploads', express.static(UPLOADS_DIR));
-
-// Interfaces
-interface User {
-  uid: string;
-  name: string;
-  email: string;
-  passwordHash?: string;
-  branch: string;
-  year: string;
-  bio: string;
-  skills: string[];
-  avatarUrl?: string;
-  initials: string;
-  color?: string;
+async function removeRecord(collectionName: string, key: string, value: string) {
+  if (!mongoDb) throw new Error('MongoDB is not connected.');
+  await mongoDb.collection(collectionName).deleteOne({ [key]: value });
 }
-
-function sanitizeUser(u: User, isAuthenticated: boolean = true) {
-  if (!isAuthenticated) {
-    return {
-      uid: u.uid,
-      name: "User",
-      email: "",
-      branch: u.branch,
-      year: u.year,
-      bio: "Campus Connect Student",
-      skills: u.skills || [],
-      avatarUrl: "",
-      initials: "U",
-      color: "#0F1B3D"
-    };
-  }
-
-  const { passwordHash, ...safe } = u;
-  return safe;
-}
-
-interface Connection {
-  id: string;
-  requesterId: string;
-  recipientId: string;
-  requesterName: string;
-  recipientName: string;
-  status: 'pending' | 'accepted' | 'rejected';
-  createdAt: string;
-  updatedAt: string;
-}
-
-interface Message {
-  id: string;
-  from: string;
-  to: string;
-  participants: string[];
-  text: string;
-  createdAt: string;
-}
-
-export interface Notification {
-  id: string;
-  recipientId: string;
-  senderId: string;
-  senderName: string;
-  senderAvatarUrl?: string;
-  senderInitials: string;
-  type: 'new_student_registration' | 'connection_request' | 'connection_accepted' | 'message';
-  message: string;
-  relatedUserId: string;
-  isRead: boolean;
-  createdAt: string;
-}
-
-// Helper functions for persistent files
-function readJsonFile<T>(filePath: string, fallback: T): T {
-  try {
-    if (fs.existsSync(filePath)) {
-      const data = fs.readFileSync(filePath, 'utf-8');
-      return JSON.parse(data) || fallback;
-    }
-  } catch (err) {
-    console.error(`[Storage] Error reading ${filePath}:`, err);
-  }
-  return fallback;
-}
-
-function writeJsonFile<T>(filePath: string, data: T) {
-  try {
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8');
-  } catch (err) {
-    console.error(`[Storage] Error writing ${filePath}:`, err);
-  }
-}
-
-// Initialize in-memory caches from disk (No default or dummy profiles!)
-let usersCache: User[] = readJsonFile<User[]>(USERS_FILE, []);
-let connectionsCache: Connection[] = readJsonFile<Connection[]>(CONNECTIONS_FILE, []);
-let messagesCache: Message[] = readJsonFile<Message[]>(MESSAGES_FILE, []);
-let notificationsCache: Notification[] = readJsonFile<Notification[]>(NOTIFICATIONS_FILE, []);
+let usersCache: User[] = [];
+let connectionsCache: Connection[] = [];
+let messagesCache: Message[] = [];
+let notificationsCache: Notification[] = [];
 
 // Socket.io Setup with robust transport configuration
 const io = new Server(httpServer, {
   cors: {
-    origin: '*',
+    origin: allowedOrigins,
     methods: ['GET', 'POST']
   },
   transports: ['polling', 'websocket']
@@ -187,7 +110,7 @@ io.on('connection', (socket) => {
   console.log(`[Socket] Connected: ${userId} (Socket ID: ${socket.id}). Joined private room: ${privateRoom}`);
 
   // Message sending
-  socket.on('send_message', (payload: { to: string; text: string; tempId?: string }) => {
+  socket.on('send_message', async (payload: { to: string; text: string; tempId?: string }) => {
     const { to, text, tempId } = payload || {};
 
     if (!to || !text || !text.trim()) {
@@ -211,7 +134,7 @@ io.on('connection', (socket) => {
 
     // Save to persistent storage
     messagesCache.push(message);
-    writeJsonFile(MESSAGES_FILE, messagesCache);
+    await saveRecord('messages', 'id', message);
 
     console.log(`[Socket Message] From ${userId} -> ${to} | ID: ${message.id} | "${message.text.substring(0, 30)}..."`);
 
@@ -302,7 +225,7 @@ app.post('/api/auth/register', async (req, res) => {
 
   // 1. Save new student in database
   usersCache.push(newUser);
-  writeJsonFile(USERS_FILE, usersCache);
+  await saveRecord('users', 'uid', newUser);
 
   // 2. Notify all existing registered students (excluding the new student)
   const existingUsers = usersCache.filter(u => u.uid !== newUser.uid);
@@ -330,6 +253,7 @@ app.post('/api/auth/register', async (req, res) => {
         createdAt: now
       };
       notificationsCache.push(notif);
+      await saveRecord('notifications', 'id', notif);
 
       // Real-time delivery via Socket.io to online user
       io.to(`user:${existingUser.uid}`).emit('receive_notification', notif);
@@ -337,7 +261,7 @@ app.post('/api/auth/register', async (req, res) => {
     }
   });
 
-  writeJsonFile(NOTIFICATIONS_FILE, notificationsCache);
+
 
   // 3. Broadcast real-time student directory update
   io.emit('user_registered', {
@@ -369,7 +293,7 @@ app.get('/api/notifications', requireAuth, (req, res) => {
 });
 
 // Mark single notification as read
-app.patch('/api/notifications/:id/read', requireAuth, (req, res) => {
+app.patch('/api/notifications/:id/read', requireAuth, async (req, res) => {
   const userId = (req as any).user.uid;
   const notifId = req.params.id;
 
@@ -379,12 +303,12 @@ app.patch('/api/notifications/:id/read', requireAuth, (req, res) => {
   }
 
   notif.isRead = true;
-  writeJsonFile(NOTIFICATIONS_FILE, notificationsCache);
+  await saveRecord('notifications', 'id', notif);
   res.json(notif);
 });
 
 // Mark all notifications as read
-app.post('/api/notifications/read-all', requireAuth, (req, res) => {
+app.post('/api/notifications/read-all', requireAuth, async (req, res) => {
   const userId = (req as any).user.uid;
   let count = 0;
 
@@ -396,7 +320,7 @@ app.post('/api/notifications/read-all', requireAuth, (req, res) => {
   });
 
   if (count > 0) {
-    writeJsonFile(NOTIFICATIONS_FILE, notificationsCache);
+    await Promise.all(notificationsCache.filter(n => n.recipientId === userId && n.isRead).map(n => saveRecord('notifications', 'id', n)));
   }
 
   res.json({ success: true, markedCount: count });
@@ -519,7 +443,7 @@ app.get('/api/users/:id', (req, res) => {
 });
 
 // USERS: Update current user's profile
-app.put('/api/users/me', requireAuth, (req, res) => {
+app.put('/api/users/me', requireAuth, async (req, res) => {
   const userId = (req as any).user.uid;
   const { name, branch, year, bio, skills, avatarUrl } = req.body;
 
@@ -550,7 +474,7 @@ app.put('/api/users/me', requireAuth, (req, res) => {
     userIndex = usersCache.length - 1;
   }
 
-  writeJsonFile(USERS_FILE, usersCache);
+  await saveRecord('users', 'uid', usersCache[userIndex]);
   res.json(usersCache[userIndex]);
 });
 
@@ -584,7 +508,7 @@ const avatarUpload = multer({
 
 // USERS: Upload and save student profile picture
 app.post('/api/users/me/avatar', requireAuth, (req: Request, res: Response) => {
-  avatarUpload.single('avatar')(req, res, (err: any) => {
+  avatarUpload.single('avatar')(req, res, async (err: any) => {
     if (err) {
       if (err.code === 'LIMIT_FILE_SIZE') {
         return res.status(400).json({ error: 'File size exceeds 5 MB. Please select a smaller photo.' });
@@ -617,7 +541,7 @@ app.post('/api/users/me/avatar', requireAuth, (req: Request, res: Response) => {
 
     const avatarUrl = `/uploads/${req.file.filename}`;
     usersCache[userIndex].avatarUrl = avatarUrl;
-    writeJsonFile(USERS_FILE, usersCache);
+    await saveRecord('users', 'uid', usersCache[userIndex]);
 
     // Broadcast user profile update to real-time directory
     io.emit('user_updated', {
@@ -637,7 +561,7 @@ app.post('/api/users/me/avatar', requireAuth, (req: Request, res: Response) => {
 });
 
 // USERS: Remove student profile picture
-app.delete('/api/users/me/avatar', requireAuth, (req: Request, res: Response) => {
+app.delete('/api/users/me/avatar', requireAuth, async (req: Request, res: Response) => {
   const userId = (req as any).user.uid;
   const userIndex = usersCache.findIndex(u => u.uid === userId);
   if (userIndex === -1) {
@@ -654,7 +578,7 @@ app.delete('/api/users/me/avatar', requireAuth, (req: Request, res: Response) =>
   }
 
   usersCache[userIndex].avatarUrl = '';
-  writeJsonFile(USERS_FILE, usersCache);
+  await saveRecord('users', 'uid', usersCache[userIndex]);
 
   io.emit('user_updated', {
     uid: userId,
@@ -681,7 +605,7 @@ app.get('/api/connections', requireAuth, (req, res) => {
 });
 
 // CONNECTIONS: Send connection request
-app.post('/api/connections/:userId', requireAuth, (req, res) => {
+app.post('/api/connections/:userId', requireAuth, async (req, res) => {
   const requesterId = (req as any).user.uid;
   const recipientId = req.params.userId;
   const requesterUser = usersCache.find(u => u.uid === requesterId);
@@ -713,7 +637,7 @@ app.post('/api/connections/:userId', requireAuth, (req, res) => {
   };
 
   connectionsCache.push(newConn);
-  writeJsonFile(CONNECTIONS_FILE, connectionsCache);
+  await saveRecord('connections', 'id', newConn);
 
   // Notify recipient via socket if connected
   io.to(`user:${recipientId}`).emit('connection_updated', newConn);
@@ -722,7 +646,7 @@ app.post('/api/connections/:userId', requireAuth, (req, res) => {
 });
 
 // CONNECTIONS: Accept or update request
-app.put('/api/connections/:requestId', requireAuth, (req, res) => {
+app.put('/api/connections/:requestId', requireAuth, async (req, res) => {
   const userId = (req as any).user.uid;
   const { status } = req.body;
   const requestId = req.params.requestId;
@@ -738,7 +662,7 @@ app.put('/api/connections/:requestId', requireAuth, (req, res) => {
 
   conn.status = status || 'accepted';
   conn.updatedAt = new Date().toISOString();
-  writeJsonFile(CONNECTIONS_FILE, connectionsCache);
+  await saveRecord('connections', 'id', conn);
 
   // Notify both participants in real time
   io.to(`user:${conn.requesterId}`).emit('connection_updated', conn);
@@ -748,7 +672,7 @@ app.put('/api/connections/:requestId', requireAuth, (req, res) => {
 });
 
 // CONNECTIONS: Delete or reject connection
-app.delete('/api/connections/:requestId', requireAuth, (req, res) => {
+app.delete('/api/connections/:requestId', requireAuth, async (req, res) => {
   const userId = (req as any).user.uid;
   const requestId = req.params.requestId;
 
@@ -763,7 +687,7 @@ app.delete('/api/connections/:requestId', requireAuth, (req, res) => {
   }
 
   connectionsCache.splice(connIndex, 1);
-  writeJsonFile(CONNECTIONS_FILE, connectionsCache);
+  await removeRecord('connections', 'id', requestId);
 
   // Notify both participants in real time
   io.to(`user:${conn.requesterId}`).emit('connection_removed', { id: requestId });
@@ -818,7 +742,7 @@ app.get('/api/messages/:userId', requireAuth, (req, res) => {
 });
 
 // MESSAGES: REST fallback to send message
-app.post('/api/messages/:userId', requireAuth, (req, res) => {
+app.post('/api/messages/:userId', requireAuth, async (req, res) => {
   const currentUserId = (req as any).user.uid;
   const targetUserId = req.params.userId;
   const { text } = req.body;
@@ -841,7 +765,7 @@ app.post('/api/messages/:userId', requireAuth, (req, res) => {
   };
 
   messagesCache.push(message);
-  writeJsonFile(MESSAGES_FILE, messagesCache);
+  await saveRecord('messages', 'id', message);
 
   // Deliver via Socket.io to recipient's private room
   io.to(`user:${targetUserId}`).emit('receive_message', message);
@@ -851,6 +775,7 @@ app.post('/api/messages/:userId', requireAuth, (req, res) => {
 
 // Start Server and Mount Vite (with HMR disabled in middleware mode)
 async function startServer() {
+  await connectDatabase();
   if (!isProd) {
     console.log('[Server] Starting in development mode with Vite middlewares attached to httpServer...');
     const vite = await createViteServer({
