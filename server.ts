@@ -472,7 +472,7 @@ app.put('/api/users/me', requireAuth, async (req, res) => {
   }
 
   await saveRecord('users', 'uid', usersCache[userIndex]);
-  res.json(usersCache[userIndex]);
+  res.json(sanitizeUser(usersCache[userIndex], true));
 });
 
 // Avatar images are stored in Cloudinary, not on the Render instance filesystem.
