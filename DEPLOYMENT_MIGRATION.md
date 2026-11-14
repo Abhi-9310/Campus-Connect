@@ -12,7 +12,7 @@
 Create a Web Service from this repository and select branch `deployment/render-mongodb`.
 
 - Runtime: Node
-- Build command: `npm install`
+- Build command: `npm install && npm run build`
 - Start command: `npm start`
 - Health check path: `/api/health`
 
