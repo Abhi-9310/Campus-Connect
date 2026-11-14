@@ -2,12 +2,11 @@ import express, { Request, Response, NextFunction } from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
-import path from 'path';
-import fs from 'fs';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import multer from 'multer';
 import { MongoClient } from 'mongodb';
+import { v2 as cloudinary } from 'cloudinary';
 import { createServer as createViteServer } from 'vite';
 
 const app = express();
@@ -58,9 +57,9 @@ async function connectDatabase() {
   notificationsCache = await mongoDb.collection('notifications').find({}, { projection: { _id: 0 } }).toArray() as Notification[];
   console.log(`[MongoDB] Connected. Loaded ${usersCache.length} users, ${connectionsCache.length} connections, ${messagesCache.length} messages and ${notificationsCache.length} notifications.`);
 }
-async function saveRecord<T extends Record<string, any>>(collectionName: string, key: string, record: T) {
+async function saveRecord(collectionName: string, key: string, record: any) {
   if (!mongoDb) throw new Error('MongoDB is not connected.');
-  const { _id, ...document } = record as T & { _id?: unknown };
+  const { _id, ...document } = record;
   await mongoDb.collection(collectionName).updateOne({ [key]: document[key] }, { $set: document }, { upsert: true });
 }
 async function removeRecord(collectionName: string, key: string, value: string) {
@@ -231,7 +230,7 @@ app.post('/api/auth/register', async (req, res) => {
   const existingUsers = usersCache.filter(u => u.uid !== newUser.uid);
   const now = new Date().toISOString();
 
-  existingUsers.forEach(existingUser => {
+  for (const existingUser of existingUsers) {
     // Prevent duplicate notifications
     const alreadyNotified = notificationsCache.some(
       n => n.recipientId === existingUser.uid && 
@@ -259,9 +258,7 @@ app.post('/api/auth/register', async (req, res) => {
       io.to(`user:${existingUser.uid}`).emit('receive_notification', notif);
       console.log(`[Notification] Delivered new student registration alert to user:${existingUser.uid}`);
     }
-  });
-
-
+  }
 
   // 3. Broadcast real-time student directory update
   io.emit('user_registered', {
@@ -478,115 +475,83 @@ app.put('/api/users/me', requireAuth, async (req, res) => {
   res.json(usersCache[userIndex]);
 });
 
-// Configure Multer for Avatar Uploads
-const avatarStorage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, UPLOADS_DIR);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase() || '.png';
-    const safeExt = ['.jpg', '.jpeg', '.png', '.webp'].includes(ext) ? ext : '.png';
-    const uniqueName = `avatar_${(req as any).user?.uid || 'student'}_${Date.now()}${safeExt}`;
-    cb(null, uniqueName);
-  }
-});
-
+// Avatar images are stored in Cloudinary, not on the Render instance filesystem.
 const avatarUpload = multer({
-  storage: avatarStorage,
-  limits: {
-    fileSize: 5 * 1024 * 1024 // 5 MB
-  },
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowedMimes = ['image/jpeg', 'image/png', 'image/webp', 'image/jpg'];
-    if (allowedMimes.includes(file.mimetype.toLowerCase())) {
-      cb(null, true);
-    } else {
-      cb(new Error('INVALID_FILE_TYPE'));
-    }
+    if (allowedMimes.includes(file.mimetype.toLowerCase())) cb(null, true);
+    else cb(new Error('INVALID_FILE_TYPE'));
   }
 });
 
-// USERS: Upload and save student profile picture
+function uploadAvatar(buffer: Buffer, userId: string): Promise<{ url: string; publicId: string }> {
+  if (!process.env.CLOUDINARY_CLOUD_NAME || !process.env.CLOUDINARY_API_KEY || !process.env.CLOUDINARY_API_SECRET) {
+    throw new Error('Cloudinary environment variables are not configured.');
+  }
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+    secure: true
+  });
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      { folder: 'campus-connect/avatars', public_id: `${userId}_${Date.now()}`, resource_type: 'image' },
+      (error, result) => {
+        if (error || !result) return reject(error || new Error('Cloudinary upload failed'));
+        resolve({ url: result.secure_url, publicId: result.public_id });
+      }
+    );
+    stream.end(buffer);
+  });
+}
+
 app.post('/api/users/me/avatar', requireAuth, (req: Request, res: Response) => {
   avatarUpload.single('avatar')(req, res, async (err: any) => {
     if (err) {
-      if (err.code === 'LIMIT_FILE_SIZE') {
-        return res.status(400).json({ error: 'File size exceeds 5 MB. Please select a smaller photo.' });
-      }
-      if (err.message === 'INVALID_FILE_TYPE') {
-        return res.status(400).json({ error: 'Invalid file type. Only JPG, JPEG, PNG, and WebP images are supported.' });
-      }
+      if (err.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: 'File size exceeds 5 MB. Please select a smaller photo.' });
+      if (err.message === 'INVALID_FILE_TYPE') return res.status(400).json({ error: 'Invalid file type. Only JPG, JPEG, PNG, and WebP images are supported.' });
       return res.status(400).json({ error: err.message || 'Error processing upload' });
     }
-
-    if (!req.file) {
-      return res.status(400).json({ error: 'No image file was provided.' });
-    }
+    if (!req.file) return res.status(400).json({ error: 'No image file was provided.' });
 
     const userId = (req as any).user.uid;
     const userIndex = usersCache.findIndex(u => u.uid === userId);
-    if (userIndex === -1) {
-      return res.status(404).json({ error: 'Student account not found' });
+    if (userIndex === -1) return res.status(404).json({ error: 'Student account not found' });
+
+    try {
+      const uploaded = await uploadAvatar(req.file.buffer, userId);
+      const oldPublicId = usersCache[userIndex].avatarPublicId;
+      usersCache[userIndex].avatarUrl = uploaded.url;
+      usersCache[userIndex].avatarPublicId = uploaded.publicId;
+      await saveRecord('users', 'uid', usersCache[userIndex]);
+      if (oldPublicId) await cloudinary.uploader.destroy(oldPublicId).catch(() => null);
+      io.emit('user_updated', { uid: userId, avatarUrl: uploaded.url });
+      res.json({
+        success: true,
+        message: 'Profile picture uploaded successfully',
+        avatarUrl: uploaded.url,
+        user: sanitizeUser(usersCache[userIndex], true)
+      });
+    } catch (uploadError) {
+      console.error('[Avatar Upload] Failed:', uploadError);
+      res.status(502).json({ error: 'Could not store profile picture. Please try again.' });
     }
-
-    // Clean up previous uploaded avatar file if local
-    const oldAvatar = usersCache[userIndex].avatarUrl;
-    if (oldAvatar && oldAvatar.startsWith('/uploads/')) {
-      const oldFilename = path.basename(oldAvatar);
-      const oldPath = path.join(UPLOADS_DIR, oldFilename);
-      if (fs.existsSync(oldPath)) {
-        try { fs.unlinkSync(oldPath); } catch {}
-      }
-    }
-
-    const avatarUrl = `/uploads/${req.file.filename}`;
-    usersCache[userIndex].avatarUrl = avatarUrl;
-    await saveRecord('users', 'uid', usersCache[userIndex]);
-
-    // Broadcast user profile update to real-time directory
-    io.emit('user_updated', {
-      uid: userId,
-      avatarUrl
-    });
-
-    console.log(`[Avatar Upload] Successfully uploaded avatar for ${userId}: ${avatarUrl}`);
-
-    res.json({
-      success: true,
-      message: 'Profile picture uploaded successfully',
-      avatarUrl,
-      user: sanitizeUser(usersCache[userIndex], true)
-    });
   });
 });
 
-// USERS: Remove student profile picture
 app.delete('/api/users/me/avatar', requireAuth, async (req: Request, res: Response) => {
   const userId = (req as any).user.uid;
   const userIndex = usersCache.findIndex(u => u.uid === userId);
-  if (userIndex === -1) {
-    return res.status(404).json({ error: 'Student account not found' });
-  }
-
-  const oldAvatar = usersCache[userIndex].avatarUrl;
-  if (oldAvatar && oldAvatar.startsWith('/uploads/')) {
-    const oldFilename = path.basename(oldAvatar);
-    const oldPath = path.join(UPLOADS_DIR, oldFilename);
-    if (fs.existsSync(oldPath)) {
-      try { fs.unlinkSync(oldPath); } catch {}
-    }
-  }
-
+  if (userIndex === -1) return res.status(404).json({ error: 'Student account not found' });
+  const oldPublicId = usersCache[userIndex].avatarPublicId;
+  if (oldPublicId) await cloudinary.uploader.destroy(oldPublicId).catch(() => null);
   usersCache[userIndex].avatarUrl = '';
+  usersCache[userIndex].avatarPublicId = '';
   await saveRecord('users', 'uid', usersCache[userIndex]);
-
-  io.emit('user_updated', {
-    uid: userId,
-    avatarUrl: ''
-  });
-
-  console.log(`[Avatar Remove] Removed avatar for ${userId}`);
-
+  io.emit('user_updated', { uid: userId, avatarUrl: '' });
   res.json({
     success: true,
     message: 'Profile picture removed successfully',
