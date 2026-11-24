@@ -1,7 +1,33 @@
 import { io } from 'socket.io-client';
 
-const API_BASE_URL = (import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
-const apiUrl = (path) => `${API_BASE_URL}${path}`;
+const API_BASE_URL = (import.meta.env.VITE_API_URL || '').trim().replace(/\/+$/, '');
+const apiUrl = (path) => {
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  return API_BASE_URL ? `${API_BASE_URL}${normalizedPath}` : normalizedPath;
+};
+
+export function resolveAssetUrl(url) {
+  if (!url) return '';
+  if (/^(https?:|data:|blob:)/i.test(url)) return url;
+  if (url.startsWith('/') && API_BASE_URL) {
+    return `${API_BASE_URL}${url}`;
+  }
+  return url;
+}
+
+async function parseJsonSafely(res) {
+  const text = await res.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(
+      res.ok
+        ? 'Unexpected response format from server'
+        : `Server error (${res.status}). Please verify the backend service is running.`
+    );
+  }
+}
 
 let socket = null;
 let currentToken = null;
@@ -13,13 +39,30 @@ const notificationListeners = new Set();
 const registrationListeners = new Set();
 const userUpdateListeners = new Set();
 
+export function getStoredToken(uid) {
+  const globalToken = sessionStorage.getItem('cc_token');
+  if (globalToken) return globalToken;
+  if (uid) {
+    return sessionStorage.getItem(`cc_token_${uid}`);
+  }
+  return null;
+}
+
+export function clearStoredTokens(uid) {
+  currentToken = null;
+  sessionStorage.removeItem('cc_token');
+  if (uid) {
+    sessionStorage.removeItem(`cc_token_${uid}`);
+  }
+}
+
 /**
  * Obtain a signed JWT for the authenticated student from backend
  */
 export async function getAuthToken(user) {
   if (!user || !user.uid) return null;
 
-  const cached = sessionStorage.getItem(`cc_token_${user.uid}`);
+  const cached = getStoredToken(user.uid);
   if (cached) {
     currentToken = cached;
     return cached;
@@ -40,8 +83,9 @@ export async function getAuthToken(user) {
       throw new Error(`Auth token request failed: ${res.statusText}`);
     }
 
-    const data = await res.json();
-    if (data.token) {
+    const data = await parseJsonSafely(res);
+    if (data?.token) {
+      sessionStorage.setItem('cc_token', data.token);
       sessionStorage.setItem(`cc_token_${user.uid}`, data.token);
       currentToken = data.token;
       return data.token;
@@ -50,6 +94,30 @@ export async function getAuthToken(user) {
     console.error('[Socket Client] Failed to retrieve JWT token:', err);
   }
   return null;
+}
+
+/**
+ * Verify JWT and load latest student profile from backend
+ */
+export async function apiFetchMe(token) {
+  const authToken = token || currentToken || sessionStorage.getItem('cc_token');
+  if (!authToken) return null;
+
+  const res = await fetch(apiUrl('/api/auth/me'), {
+    headers: {
+      'Authorization': `Bearer ${authToken}`
+    }
+  });
+
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 404) {
+      clearStoredTokens();
+    }
+    return null;
+  }
+
+  currentToken = authToken;
+  return await parseJsonSafely(res);
 }
 
 /**
@@ -232,14 +300,9 @@ export async function apiRegister(payload) {
     body: JSON.stringify(payload)
   });
 
-  const data = await res.json();
+  const data = await parseJsonSafely(res);
   if (!res.ok) {
-    throw new Error(data.error || 'Registration failed');
-  }
-
-  if (data.token) {
-    currentToken = data.token;
-    sessionStorage.setItem(`cc_token_${data.user.uid}`, data.token);
+    throw new Error(data?.error || 'Registration failed');
   }
 
   return data;
@@ -255,13 +318,14 @@ export async function apiLogin(email, password) {
     body: JSON.stringify({ email, password })
   });
 
-  const data = await res.json();
+  const data = await parseJsonSafely(res);
   if (!res.ok) {
-    throw new Error(data.error || 'Login failed');
+    throw new Error(data?.error || 'Login failed');
   }
 
-  if (data.token) {
+  if (data?.token && data?.user?.uid) {
     currentToken = data.token;
+    sessionStorage.setItem('cc_token', data.token);
     sessionStorage.setItem(`cc_token_${data.user.uid}`, data.token);
   }
 

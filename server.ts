@@ -1,5 +1,8 @@
 import express, { Request, Response, NextFunction } from 'express';
 import http from 'http';
+import crypto from 'crypto';
+import path from 'path';
+import fs from 'fs';
 import { Server } from 'socket.io';
 import cors from 'cors';
 import jwt from 'jsonwebtoken';
@@ -13,20 +16,43 @@ const app = express();
 const httpServer = http.createServer(app);
 const isProd = process.env.NODE_ENV === 'production';
 const PORT = Number(process.env.PORT) || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || (isProd ? '' : 'campus_connect_local_dev_secret');
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 
-if (isProd && !JWT_SECRET) {
-  throw new Error('JWT_SECRET must be configured in the production environment.');
+if (isProd && !process.env.JWT_SECRET) {
+  console.warn('[Security] JWT_SECRET is not set; using an ephemeral runtime signing key.');
 }
 
-const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:3000')
-  .split(',')
-  .map(origin => origin.trim())
+const allowedOrigins = [
+  process.env.CLIENT_URL,
+  process.env.FRONTEND_URL,
+  process.env.APP_URL,
+  ...(process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',') : []),
+  'http://localhost:3000'
+]
+  .map(origin => (origin || '').trim().replace(/\/+$/, ''))
   .filter(Boolean);
+
+function isAllowedOrigin(origin?: string): boolean {
+  if (!origin) return true;
+  const normalized = origin.replace(/\/+$/, '');
+  if (allowedOrigins.includes(normalized)) return true;
+  try {
+    const host = new URL(normalized).hostname.toLowerCase();
+    return (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host.endsWith('.run.app') ||
+      host.endsWith('.vercel.app') ||
+      host.endsWith('.onrender.com')
+    );
+  } catch {
+    return false;
+  }
+}
 
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    if (isAllowedOrigin(origin)) return callback(null, true);
     return callback(new Error('Origin not allowed by CORS'));
   },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -34,11 +60,38 @@ app.use(cors({
 }));
 app.use(express.json());
 
+const DATA_DIR = path.resolve(process.cwd(), 'data');
+function readLocalFallback<T>(name: string): T[] {
+  try {
+    const file = path.join(DATA_DIR, `${name}.json`);
+    if (fs.existsSync(file)) {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      return Array.isArray(parsed) ? parsed : [];
+    }
+  } catch {}
+  return [];
+}
+function writeLocalFallback(name: string, data: unknown[]) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(path.join(DATA_DIR, `${name}.json`), JSON.stringify(data, null, 2), 'utf-8');
+  } catch (err) {
+    console.warn(`[Storage] Could not write fallback ${name}.json:`, err);
+  }
+}
+
 // MongoDB persistence. Caches are loaded at startup and each mutation is written to MongoDB.
-let mongoDb: import('mongodb').Db;
+let mongoDb: import('mongodb').Db | null = null;
 async function connectDatabase() {
   const uri = process.env.MONGODB_URI;
-  if (!uri) throw new Error('MONGODB_URI must be configured.');
+  if (!uri) {
+    console.warn('[MongoDB] MONGODB_URI is not set. Using local JSON/in-memory persistence.');
+    usersCache = readLocalFallback<User>('users');
+    connectionsCache = readLocalFallback<Connection>('connections');
+    messagesCache = readLocalFallback<Message>('messages');
+    notificationsCache = readLocalFallback<Notification>('notifications');
+    return;
+  }
   const client = new MongoClient(uri, { serverSelectionTimeoutMS: 10000 });
   await client.connect();
   mongoDb = client.db();
@@ -51,21 +104,112 @@ async function connectDatabase() {
     mongoDb.collection('notifications').createIndex({ id: 1 }, { unique: true }),
     mongoDb.collection('notifications').createIndex({ recipientId: 1, createdAt: -1 })
   ]);
-  usersCache = await mongoDb.collection('users').find({}, { projection: { _id: 0 } }).toArray() as User[];
-  connectionsCache = await mongoDb.collection('connections').find({}, { projection: { _id: 0 } }).toArray() as Connection[];
-  messagesCache = await mongoDb.collection('messages').find({}, { projection: { _id: 0 } }).toArray() as Message[];
-  notificationsCache = await mongoDb.collection('notifications').find({}, { projection: { _id: 0 } }).toArray() as Notification[];
+  usersCache = await mongoDb.collection<User>('users').find({}, { projection: { _id: 0 } }).toArray();
+  connectionsCache = await mongoDb.collection<Connection>('connections').find({}, { projection: { _id: 0 } }).toArray();
+  messagesCache = await mongoDb.collection<Message>('messages').find({}, { projection: { _id: 0 } }).toArray();
+  notificationsCache = await mongoDb.collection<Notification>('notifications').find({}, { projection: { _id: 0 } }).toArray();
   console.log(`[MongoDB] Connected. Loaded ${usersCache.length} users, ${connectionsCache.length} connections, ${messagesCache.length} messages and ${notificationsCache.length} notifications.`);
 }
 async function saveRecord(collectionName: string, key: string, record: any) {
-  if (!mongoDb) throw new Error('MongoDB is not connected.');
+  if (!mongoDb) {
+    const cacheMap: Record<string, unknown[]> = {
+      users: usersCache,
+      connections: connectionsCache,
+      messages: messagesCache,
+      notifications: notificationsCache
+    };
+    if (cacheMap[collectionName]) {
+      writeLocalFallback(collectionName, cacheMap[collectionName]);
+    }
+    return;
+  }
   const { _id, ...document } = record;
   await mongoDb.collection(collectionName).updateOne({ [key]: document[key] }, { $set: document }, { upsert: true });
 }
 async function removeRecord(collectionName: string, key: string, value: string) {
-  if (!mongoDb) throw new Error('MongoDB is not connected.');
+  if (!mongoDb) {
+    const cacheMap: Record<string, unknown[]> = {
+      users: usersCache,
+      connections: connectionsCache,
+      messages: messagesCache,
+      notifications: notificationsCache
+    };
+    if (cacheMap[collectionName]) {
+      writeLocalFallback(collectionName, cacheMap[collectionName]);
+    }
+    return;
+  }
   await mongoDb.collection(collectionName).deleteOne({ [key]: value });
 }
+interface User {
+  uid: string;
+  name: string;
+  email: string;
+  passwordHash?: string;
+  branch: string;
+  year: string;
+  bio: string;
+  skills: string[];
+  avatarUrl?: string;
+  avatarPublicId?: string;
+  initials: string;
+  color?: string;
+}
+
+function sanitizeUser(u: User, isAuthenticated: boolean = true) {
+  if (!isAuthenticated) {
+    return {
+      uid: u.uid,
+      name: 'User',
+      email: '',
+      branch: u.branch,
+      year: u.year,
+      bio: 'Campus Connect Student',
+      skills: u.skills || [],
+      avatarUrl: '',
+      initials: 'U',
+      color: '#0F1B3D'
+    };
+  }
+
+  const { passwordHash: _passwordHash, avatarPublicId: _avatarPublicId, ...safe } = u;
+  return safe;
+}
+
+interface Connection {
+  id: string;
+  requesterId: string;
+  recipientId: string;
+  requesterName: string;
+  recipientName: string;
+  status: 'pending' | 'accepted' | 'rejected';
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface Message {
+  id: string;
+  from: string;
+  to: string;
+  participants: string[];
+  text: string;
+  createdAt: string;
+}
+
+export interface Notification {
+  id: string;
+  recipientId: string;
+  senderId: string;
+  senderName: string;
+  senderAvatarUrl?: string;
+  senderInitials: string;
+  type: 'new_student_registration' | 'connection_request' | 'connection_accepted' | 'message';
+  message: string;
+  relatedUserId: string;
+  isRead: boolean;
+  createdAt: string;
+}
+
 let usersCache: User[] = [];
 let connectionsCache: Connection[] = [];
 let messagesCache: Message[] = [];
@@ -74,7 +218,10 @@ let notificationsCache: Notification[] = [];
 // Socket.io Setup with robust transport configuration
 const io = new Server(httpServer, {
   cors: {
-    origin: allowedOrigins,
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) return callback(null, true);
+      return callback(new Error('Origin not allowed by CORS'));
+    },
     methods: ['GET', 'POST']
   },
   transports: ['polling', 'websocket']
@@ -751,7 +898,11 @@ app.post('/api/messages/:userId', requireAuth, async (req, res) => {
 
 // Start Server and Mount Vite (with HMR disabled in middleware mode)
 async function startServer() {
-  await connectDatabase();
+  try {
+    await connectDatabase();
+  } catch (err) {
+    console.error('[MongoDB] Startup connection failed; continuing with in-memory/local fallback:', err);
+  }
   if (!isProd) {
     console.log('[Server] Starting in development mode with Vite middlewares attached to httpServer...');
     const vite = await createViteServer({
@@ -766,10 +917,22 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    console.log('[Server] Starting API and Socket.IO in production mode...');
-    app.use((req, res) => {
-      res.status(404).json({ error: 'API route not found' });
-    });
+    const distDir = path.resolve(process.cwd(), 'dist');
+    if (fs.existsSync(distDir)) {
+      console.log('[Server] Starting in production mode serving dist + API + Socket.IO...');
+      app.use(express.static(distDir));
+      app.get('*', (req, res) => {
+        if (req.path.startsWith('/api/')) {
+          return res.status(404).json({ error: 'API route not found' });
+        }
+        return res.sendFile(path.join(distDir, 'index.html'));
+      });
+    } else {
+      console.log('[Server] Starting API and Socket.IO in production mode...');
+      app.use((req, res) => {
+        res.status(404).json({ error: 'API route not found' });
+      });
+    }
   }
 
   httpServer.listen(PORT, '0.0.0.0', () => {
