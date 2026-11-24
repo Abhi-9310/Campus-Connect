@@ -10,6 +10,7 @@ import {
   ChevronLeft
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { resolveAssetUrl } from '../services/socket';
 
 export default function Messages() {
   const { 
@@ -210,7 +211,7 @@ export default function Messages() {
                 >
                   {peer.avatarUrl ? (
                     <img 
-                      src={peer.avatarUrl} 
+                      src={resolveAssetUrl(peer.avatarUrl)} 
                       alt={peer.name}
                       className="w-10 h-10 rounded-full object-cover shrink-0 border border-[#E7EAF0]"
                     />
@@ -275,7 +276,7 @@ export default function Messages() {
 
                 {activePeer.avatarUrl ? (
                   <img 
-                    src={activePeer.avatarUrl} 
+                    src={resolveAssetUrl(activePeer.avatarUrl)} 
                     alt={activePeer.name}
                     className="w-10 h-10 rounded-full object-cover shrink-0 border border-[#E7EAF0]"
                   />

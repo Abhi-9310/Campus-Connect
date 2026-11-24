@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { 
   User, 
   Mail, 
@@ -19,6 +19,7 @@ import {
   Image as ImageIcon
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { resolveAssetUrl } from '../services/socket';
 import { BRANCHES, ACADEMIC_YEARS } from '../data/seedStudents';
 
 export default function Profile() {
@@ -46,6 +47,16 @@ export default function Profile() {
   const [skillInput, setSkillInput] = useState('');
   const [statusMessage, setStatusMessage] = useState(null);
   const [isSaving, setIsSaving] = useState(false);
+
+  useEffect(() => {
+    if (currentUser && !isEditing) {
+      setName(currentUser.name || '');
+      setBranch(currentUser.branch || 'Computer Science & Engineering');
+      setYear(currentUser.year || '3rd Year');
+      setBio(currentUser.bio || '');
+      setSkills(Array.isArray(currentUser.skills) ? currentUser.skills : []);
+    }
+  }, [currentUser, isEditing]);
 
   if (!currentUser) {
     return (
@@ -268,7 +279,7 @@ export default function Profile() {
                   />
                 ) : currentUser?.avatarUrl ? (
                   <img 
-                    src={currentUser.avatarUrl} 
+                    src={resolveAssetUrl(currentUser.avatarUrl)} 
                     alt={currentUser.name}
                     className="w-24 h-24 rounded-full object-cover border-4 border-white shadow-md bg-white" 
                   />

@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { 
   Search, 
   X, 
@@ -8,10 +8,15 @@ import {
   UserPlus, 
   Check, 
   Sparkles,
-  RotateCcw
+  RotateCcw,
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { resolveAssetUrl } from '../services/socket';
 import { SUGGESTED_SKILLS, BRANCHES, ACADEMIC_YEARS } from '../data/seedStudents';
+
+const STUDENTS_PER_PAGE = 12;
 
 export default function Discover() {
   const { 
@@ -29,6 +34,7 @@ export default function Discover() {
   const [selectedYear, setSelectedYear] = useState('All Years');
   const [selectedSkillChip, setSelectedSkillChip] = useState(null);
   const [showFilters, setShowFilters] = useState(false);
+  const [currentPage, setCurrentPage] = useState(1);
 
   // Filter out current user and apply search query & filters
   const filteredStudents = useMemo(() => {
@@ -76,7 +82,19 @@ export default function Discover() {
     setSelectedBranch('All Branches');
     setSelectedYear('All Years');
     setSelectedSkillChip(null);
+    setCurrentPage(1);
   };
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [searchQuery, selectedBranch, selectedYear, selectedSkillChip, allStudents.length]);
+
+  const totalPages = Math.max(1, Math.ceil(filteredStudents.length / STUDENTS_PER_PAGE));
+  const safePage = Math.min(currentPage, totalPages);
+  const paginatedStudents = useMemo(() => {
+    const start = (safePage - 1) * STUDENTS_PER_PAGE;
+    return filteredStudents.slice(start, start + STUDENTS_PER_PAGE);
+  }, [filteredStudents, safePage]);
 
   const hasActiveFilters = searchQuery || selectedBranch !== 'All Branches' || selectedYear !== 'All Years' || selectedSkillChip;
 
@@ -212,8 +230,9 @@ export default function Discover() {
 
       {/* Students Cards Grid */}
       {filteredStudents.length > 0 ? (
+        <>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
-          {filteredStudents.map(student => {
+          {paginatedStudents.map(student => {
             const existingConn = currentUser ? connections.find(
               c => (c.requesterId === student.uid && c.recipientId === currentUser?.uid) ||
                    (c.recipientId === student.uid && c.requesterId === currentUser?.uid)
@@ -234,7 +253,7 @@ export default function Discover() {
                   <div className="flex items-start gap-3.5">
                     {isAuthed && student.avatarUrl ? (
                       <img
-                        src={student.avatarUrl}
+                        src={resolveAssetUrl(student.avatarUrl)}
                         alt={displayName}
                         className="w-14 h-14 rounded-full object-cover shrink-0 border border-[#E7EAF0] shadow-xs"
                       />
@@ -320,6 +339,32 @@ export default function Discover() {
             );
           })}
         </div>
+        {totalPages > 1 && (
+          <div className="flex items-center justify-center gap-3 pt-2">
+            <button
+              type="button"
+              onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
+              disabled={safePage === 1}
+              className="px-3 py-1.5 rounded-xl bg-white border border-[#E7EAF0] text-xs font-semibold text-[#18233F] hover:bg-slate-50 disabled:opacity-40 flex items-center gap-1"
+            >
+              <ChevronLeft className="w-3.5 h-3.5" />
+              <span>Previous</span>
+            </button>
+            <span className="text-xs font-bold text-[#747D91]">
+              Page <span className="text-[#18233F]">{safePage}</span> of {totalPages}
+            </span>
+            <button
+              type="button"
+              onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
+              disabled={safePage === totalPages}
+              className="px-3 py-1.5 rounded-xl bg-white border border-[#E7EAF0] text-xs font-semibold text-[#18233F] hover:bg-slate-50 disabled:opacity-40 flex items-center gap-1"
+            >
+              <span>Next</span>
+              <ChevronRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+        </>
       ) : allStudents.length === 0 ? (
         /* Empty Database State */
         <div className="bg-white rounded-3xl p-12 text-center border border-[#E7EAF0] max-w-lg mx-auto shadow-xs">
@@ -336,7 +381,7 @@ export default function Discover() {
             Create your genuine student account to showcase your skills, meet campus peers, and start collaborating.
           </p>
           <button
-            onClick={() => openAuthModal('Create your account and be the first student to join Campus Connect!')}
+            onClick={() => openAuthModal('Create your account and be the first student to join Campus Connect!', 'register')}
             className="mt-6 px-6 py-2.5 rounded-xl bg-[#0F1B3D] text-[#FFC93C] font-bold text-xs hover:bg-[#18284F] transition-all inline-flex items-center gap-2 shadow-xs active:scale-95"
           >
             <UserPlus className="w-4 h-4" />

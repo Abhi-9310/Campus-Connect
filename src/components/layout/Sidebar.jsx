@@ -11,6 +11,7 @@ import {
   Share2
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
+import { resolveAssetUrl } from '../../services/socket';
 
 export default function Sidebar() {
   const { 
@@ -160,7 +161,7 @@ export default function Sidebar() {
             >
               {currentUser?.avatarUrl ? (
                 <img 
-                  src={currentUser.avatarUrl} 
+                  src={resolveAssetUrl(currentUser.avatarUrl)} 
                   alt={currentUser.name}
                   className="w-9 h-9 rounded-full object-cover border border-[#FFC93C]/40 shrink-0" 
                 />

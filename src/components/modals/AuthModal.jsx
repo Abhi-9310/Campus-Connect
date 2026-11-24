@@ -1,35 +1,36 @@
 import React, { useState, useEffect } from 'react';
-import { 
-  X, 
-  LogIn, 
-  UserPlus, 
-  Mail, 
-  Lock, 
-  User, 
-  GraduationCap, 
-  Sparkles, 
+import {
+  X,
+  LogIn,
+  UserPlus,
+  Mail,
+  Lock,
+  User,
+  Sparkles,
   AlertCircle,
+  CheckCircle2,
   Share2
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { BRANCHES, ACADEMIC_YEARS } from '../../data/seedStudents';
 
 export default function AuthModal() {
-  const { 
-    authModalOpen, 
-    authModalMessage, 
-    closeAuthModal, 
-    loginWithCredentials, 
-    registerWithCredentials, 
-    loginWithGoogle 
+  const {
+    authModalOpen,
+    authModalMessage,
+    authModalInitialTab,
+    closeAuthModal,
+    loginWithCredentials,
+    registerWithCredentials,
+    loginWithGoogle
   } = useAuth();
 
   const [activeTab, setActiveTab] = useState('login'); // 'login' | 'register'
-  
+
   // Login form state
   const [loginEmail, setLoginEmail] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
-  
+
   // Register form state
   const [regName, setRegName] = useState('');
   const [regEmail, setRegEmail] = useState('');
@@ -38,6 +39,7 @@ export default function AuthModal() {
   const [regYear, setRegYear] = useState(ACADEMIC_YEARS[1]);
 
   const [error, setError] = useState(null);
+  const [successMessage, setSuccessMessage] = useState(null);
   const [loading, setLoading] = useState(false);
 
   // Close on Escape key
@@ -51,27 +53,33 @@ export default function AuthModal() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [authModalOpen, closeAuthModal]);
 
-  // Reset form when modal opens
+  // Reset messages and sync requested initial tab whenever modal opens
   useEffect(() => {
     if (authModalOpen) {
       setError(null);
+      setSuccessMessage(null);
       setLoading(false);
+      setActiveTab(authModalInitialTab === 'register' ? 'register' : 'login');
     }
-  }, [authModalOpen]);
+  }, [authModalOpen, authModalInitialTab]);
 
   if (!authModalOpen) return null;
 
   const handleLoginSubmit = async (e) => {
     e.preventDefault();
     setError(null);
-    if (!loginEmail.trim() || !loginPassword) {
+    setSuccessMessage(null);
+
+    const trimmedEmail = loginEmail.trim();
+    if (!trimmedEmail || !loginPassword) {
       setError('Please provide both email and password.');
       return;
     }
 
     try {
       setLoading(true);
-      await loginWithCredentials(loginEmail.trim(), loginPassword);
+      await loginWithCredentials(trimmedEmail, loginPassword);
+      setLoginPassword('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Invalid credentials. Please try again.');
     } finally {
@@ -82,28 +90,43 @@ export default function AuthModal() {
   const handleRegisterSubmit = async (e) => {
     e.preventDefault();
     setError(null);
-    if (!regName.trim()) {
+    setSuccessMessage(null);
+
+    const trimmedName = regName.trim();
+    const trimmedEmail = regEmail.trim();
+
+    if (!trimmedName) {
       setError('Please enter your full name.');
       return;
     }
-    if (!regEmail.trim()) {
+    if (!trimmedEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmedEmail)) {
       setError('Please enter a valid collegiate email.');
       return;
     }
-    if (regPassword.length < 6) {
+    if (!regPassword || regPassword.length < 6) {
       setError('Password must be at least 6 characters.');
       return;
     }
 
     try {
       setLoading(true);
-      await registerWithCredentials({
-        name: regName.trim(),
-        email: regEmail.trim(),
+      const result = await registerWithCredentials({
+        name: trimmedName,
+        email: trimmedEmail,
         password: regPassword,
         branch: regBranch,
         year: regYear
       });
+
+      setLoginEmail(trimmedEmail);
+      setLoginPassword('');
+      setRegName('');
+      setRegEmail('');
+      setRegPassword('');
+      setActiveTab('login');
+      setSuccessMessage(
+        result?.message || 'Account created successfully! Please log in with your email and password.'
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Registration failed. Please try again.');
     } finally {
@@ -114,20 +137,20 @@ export default function AuthModal() {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       {/* Backdrop overlay */}
-      <div 
+      <div
         className="fixed inset-0 bg-black/60 backdrop-blur-xs transition-opacity"
         onClick={closeAuthModal}
       />
 
       {/* Modal Dialog */}
-      <div 
+      <div
         className="relative bg-white rounded-3xl shadow-2xl max-w-md w-full overflow-hidden z-10 border border-[#E7EAF0] animate-in zoom-in-95 duration-200"
       >
         {/* Top Header */}
-        <div 
+        <div
           className="p-6 text-white relative"
-          style={{ 
-            background: 'linear-gradient(135deg, #0F1B3D 0%, #18284F 60%, #2B3B6D 100%)' 
+          style={{
+            background: 'linear-gradient(135deg, #0F1B3D 0%, #18284F 60%, #2B3B6D 100%)'
           }}
         >
           <button
@@ -173,7 +196,7 @@ export default function AuthModal() {
 
           <button
             type="button"
-            onClick={() => { setActiveTab('register'); setError(null); }}
+            onClick={() => { setActiveTab('register'); setError(null); setSuccessMessage(null); }}
             className={`flex-1 py-2.5 text-xs font-bold rounded-xl transition-all flex items-center justify-center gap-1.5 ${
               activeTab === 'register'
                 ? 'bg-white text-[#0F1B3D] shadow-xs'
@@ -191,6 +214,13 @@ export default function AuthModal() {
             <div className="mb-4 p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs flex items-center gap-2">
               <AlertCircle className="w-4 h-4 shrink-0" />
               <span>{error}</span>
+            </div>
+          )}
+
+          {successMessage && (
+            <div className="mb-4 p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 shrink-0" />
+              <span>{successMessage}</span>
             </div>
           )}
 
@@ -327,7 +357,7 @@ export default function AuthModal() {
                 className="w-full py-2.5 rounded-xl bg-[#0F1B3D] hover:bg-[#18284F] text-[#FFC93C] font-bold text-xs shadow-xs transition-all flex items-center justify-center gap-2 active:scale-95 disabled:opacity-50 mt-2"
               >
                 <UserPlus className="w-3.5 h-3.5" />
-                <span>{loading ? 'Creating Account...' : 'Register & Continue'}</span>
+                <span>{loading ? 'Creating Account...' : 'Create Account'}</span>
               </button>
             </form>
           )}

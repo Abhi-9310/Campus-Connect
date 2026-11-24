@@ -14,6 +14,7 @@ import {
   Compass
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { resolveAssetUrl } from '../services/socket';
 
 export default function Dashboard() {
   const { 
@@ -196,7 +197,7 @@ export default function Dashboard() {
                     <div className="flex items-center gap-3">
                       {isAuthed && student.avatarUrl ? (
                         <img
-                          src={student.avatarUrl}
+                          src={resolveAssetUrl(student.avatarUrl)}
                           alt={displayName}
                           className="w-11 h-11 rounded-xl object-cover shrink-0 border border-[#E7EAF0]"
                         />
@@ -302,7 +303,7 @@ export default function Dashboard() {
                     <div className="flex items-center gap-3">
                       {isAuthed && student.avatarUrl ? (
                         <img 
-                          src={student.avatarUrl} 
+                          src={resolveAssetUrl(student.avatarUrl)} 
                           alt={displayName} 
                           className="w-8 h-8 rounded-full object-cover shrink-0 border border-[#E7EAF0]" 
                         />

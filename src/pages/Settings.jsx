@@ -154,7 +154,7 @@ export default function Settings() {
             <span className="text-[#747D91]">Data Persistence</span>
             <span className="font-semibold text-emerald-700 flex items-center gap-1">
               <Database className="w-3.5 h-3.5" />
-              <span>Google Firebase Firestore & Auth</span>
+              <span>MongoDB Atlas & Express API</span>
             </span>
           </div>
         </div>

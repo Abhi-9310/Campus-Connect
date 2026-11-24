@@ -11,6 +11,7 @@ import {
   ArrowRight
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
+import { resolveAssetUrl } from '../services/socket';
 
 export default function Connections() {
   const { 
@@ -144,7 +145,7 @@ export default function Connections() {
                       <div className="flex items-start gap-3.5">
                         {peer.avatarUrl ? (
                           <img
-                            src={peer.avatarUrl}
+                            src={resolveAssetUrl(peer.avatarUrl)}
                             alt={peer.name}
                             className="w-12 h-12 rounded-full object-cover shrink-0 border border-[#E7EAF0]"
                           />
@@ -251,7 +252,7 @@ export default function Connections() {
                       <div className="flex items-center gap-3">
                         {peer.avatarUrl ? (
                           <img
-                            src={peer.avatarUrl}
+                            src={resolveAssetUrl(peer.avatarUrl)}
                             alt={peer.name}
                             className="w-11 h-11 rounded-full object-cover shrink-0 border border-[#E7EAF0]"
                           />

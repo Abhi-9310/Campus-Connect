@@ -11,6 +11,7 @@ import {
   Share2
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
+import { resolveAssetUrl } from '../../services/socket';
 
 export default function MobileDrawer({ isOpen, onClose }) {
   const { 
@@ -103,7 +104,7 @@ export default function MobileDrawer({ isOpen, onClose }) {
             <div className="flex items-center gap-2 overflow-hidden">
               {currentUser?.avatarUrl ? (
                 <img 
-                  src={currentUser.avatarUrl} 
+                  src={resolveAssetUrl(currentUser.avatarUrl)} 
                   alt={currentUser.name}
                   className="w-8 h-8 rounded-full object-cover shrink-0 border border-[#FFC93C]/40" 
                 />

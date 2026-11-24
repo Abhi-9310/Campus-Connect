@@ -11,6 +11,7 @@ import {
   User
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
+import { resolveAssetUrl } from '../../services/socket';
 
 export default function Header({ onOpenMobileMenu }) {
   const { 
@@ -197,7 +198,7 @@ export default function Header({ onOpenMobileMenu }) {
             <div className="flex items-center gap-2 pl-2 border-l border-[#E7EAF0]">
               {currentUser.avatarUrl ? (
                 <img 
-                  src={currentUser.avatarUrl} 
+                  src={resolveAssetUrl(currentUser.avatarUrl)} 
                   alt={currentUser.name} 
                   className="w-7 h-7 rounded-full object-cover shrink-0 shadow-2xs border border-[#E7EAF0]" 
                 />
@@ -232,7 +233,7 @@ export default function Header({ onOpenMobileMenu }) {
             </button>
 
             <button
-              onClick={() => openAuthModal('Create your student account to connect with peers.')}
+              onClick={() => openAuthModal('Create your student account to connect with peers.', 'register')}
               className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-[#0F1B3D] hover:bg-[#18284F] text-[#FFC93C] font-semibold text-xs shadow-xs transition-all active:scale-95"
             >
               <UserCheck className="w-3.5 h-3.5" />

@@ -11,6 +11,7 @@ import {
   Award
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
+import { resolveAssetUrl } from '../../services/socket';
 
 export default function StudentProfileModal() {
   const { 
@@ -71,7 +72,7 @@ export default function StudentProfileModal() {
           <div className="flex items-end justify-between -mt-12 mb-4">
             {isAuthed && student.avatarUrl ? (
               <img 
-                src={student.avatarUrl} 
+                src={resolveAssetUrl(student.avatarUrl)} 
                 alt={displayName}
                 className="w-24 h-24 rounded-full object-cover border-4 border-white shadow-md bg-white" 
               />
