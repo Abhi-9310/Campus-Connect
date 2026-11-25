@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express, { Request, Response, NextFunction } from 'express';
 import http from 'http';
 import crypto from 'crypto';
@@ -8,7 +9,7 @@ import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import multer from 'multer';
-import { MongoClient } from 'mongodb';
+import { MongoClient, ObjectId } from 'mongodb';
 import { v2 as cloudinary } from 'cloudinary';
 import { createServer as createViteServer } from 'vite';
 
@@ -80,62 +81,439 @@ function writeLocalFallback(name: string, data: unknown[]) {
   }
 }
 
-// MongoDB persistence. Caches are loaded at startup and each mutation is written to MongoDB.
+// MongoDB persistence. Caches act only as in-process mirrors (or local-dev fallback when NODE_ENV!==production and MONGODB_URI is unset).
 let mongoDb: import('mongodb').Db | null = null;
+let mongoConnectPromise: Promise<void> | null = null;
+let lastDbError: string | null = null;
+
+class DatabaseUnavailableError extends Error {
+  statusCode: number;
+  constructor(message = 'Database connection is unavailable. Please try again shortly.') {
+    super(message);
+    this.name = 'DatabaseUnavailableError';
+    this.statusCode = 503;
+  }
+}
+
+function getMongoUri(): string {
+  return (process.env.MONGODB_URI || process.env.MONGO_URI || '').trim();
+}
+
+function isLocalMongoUri(uri: string): boolean {
+  return /^mongodb(\+srv)?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:|\/|$)/i.test(uri);
+}
+
+function isMongoConnected(): boolean {
+  return Boolean(mongoDb);
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function normalizeUserRecord(doc: any): User {
+  const uid = String(doc?.uid || (doc?._id ? doc._id.toString() : '') || '');
+  const email = typeof doc?.email === 'string' ? doc.email.toLowerCase().trim() : '';
+  const legacyHash =
+    typeof doc?.password === 'string' && doc.password.startsWith('$2')
+      ? doc.password.trim()
+      : undefined;
+  const passwordHash =
+    typeof doc?.passwordHash === 'string' && doc.passwordHash.trim()
+      ? doc.passwordHash.trim()
+      : legacyHash;
+  const name = typeof doc?.name === 'string' && doc.name.trim() ? doc.name.trim() : 'Student';
+  const derivedInitials =
+    name
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((n: string) => n[0])
+      .join('')
+      .slice(0, 2)
+      .toUpperCase() || 'CC';
+
+  return {
+    uid,
+    name,
+    email,
+    ...(passwordHash ? { passwordHash } : {}),
+    branch: doc?.branch || 'Computer Science & Engineering',
+    year: doc?.year || '1st Year',
+    bio: doc?.bio || 'Campus Connect Student',
+    skills: Array.isArray(doc?.skills) ? doc.skills : [],
+    avatarUrl: doc?.avatarUrl || '',
+    avatarPublicId: doc?.avatarPublicId || '',
+    initials: doc?.initials || derivedInitials,
+    color: doc?.color || '#0F1B3D',
+    ...(doc?.createdAt ? { createdAt: new Date(doc.createdAt).toISOString() } : {}),
+    ...(doc?.updatedAt ? { updatedAt: new Date(doc.updatedAt).toISOString() } : {})
+  };
+}
+
+function upsertUserCache(user: User) {
+  if (!user.uid) return;
+  const idx = usersCache.findIndex(u => u.uid === user.uid);
+  if (idx >= 0) {
+    usersCache[idx] = user;
+  } else {
+    usersCache.push(user);
+  }
+}
+
+async function ensureIndexSafe(collectionName: string, keys: Record<string, 1 | -1>, options: Record<string, unknown> = {}) {
+  if (!mongoDb) return;
+  try {
+    await mongoDb.collection(collectionName).createIndex(keys, options);
+  } catch (err) {
+    console.warn(`[MongoDB] Index creation warning on ${collectionName}:`, err instanceof Error ? err.message : err);
+  }
+}
+
 async function connectDatabase() {
-  const uri = process.env.MONGODB_URI;
+  const uri = getMongoUri();
   if (!uri) {
-    console.warn('[MongoDB] MONGODB_URI is not set. Using local JSON/in-memory persistence.');
-    usersCache = readLocalFallback<User>('users');
+    if (isProd) {
+      lastDbError = 'MONGODB_URI environment variable is not configured in production.';
+      console.error(`[MongoDB] CRITICAL: ${lastDbError}`);
+      throw new DatabaseUnavailableError(lastDbError);
+    }
+    lastDbError = null;
+    console.warn('[MongoDB] MONGODB_URI is not set. Using local JSON/in-memory persistence for development.');
+    usersCache = readLocalFallback<User>('users').map(normalizeUserRecord);
     connectionsCache = readLocalFallback<Connection>('connections');
     messagesCache = readLocalFallback<Message>('messages');
     notificationsCache = readLocalFallback<Notification>('notifications');
     return;
   }
-  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 10000 });
-  await client.connect();
-  mongoDb = client.db();
-  await Promise.all([
-    mongoDb.collection('users').createIndex({ uid: 1 }, { unique: true }),
-    mongoDb.collection('users').createIndex({ email: 1 }, { unique: true }),
-    mongoDb.collection('connections').createIndex({ id: 1 }, { unique: true }),
-    mongoDb.collection('messages').createIndex({ id: 1 }, { unique: true }),
-    mongoDb.collection('messages').createIndex({ participants: 1, createdAt: -1 }),
-    mongoDb.collection('notifications').createIndex({ id: 1 }, { unique: true }),
-    mongoDb.collection('notifications').createIndex({ recipientId: 1, createdAt: -1 })
-  ]);
-  usersCache = await mongoDb.collection<User>('users').find({}, { projection: { _id: 0 } }).toArray();
-  connectionsCache = await mongoDb.collection<Connection>('connections').find({}, { projection: { _id: 0 } }).toArray();
-  messagesCache = await mongoDb.collection<Message>('messages').find({}, { projection: { _id: 0 } }).toArray();
-  notificationsCache = await mongoDb.collection<Notification>('notifications').find({}, { projection: { _id: 0 } }).toArray();
-  console.log(`[MongoDB] Connected. Loaded ${usersCache.length} users, ${connectionsCache.length} connections, ${messagesCache.length} messages and ${notificationsCache.length} notifications.`);
+
+  if (isProd && isLocalMongoUri(uri)) {
+    lastDbError = 'Production MONGODB_URI must point to MongoDB Atlas, not localhost.';
+    console.error(`[MongoDB] CRITICAL: ${lastDbError}`);
+    throw new DatabaseUnavailableError(lastDbError);
+  }
+
+  try {
+    const client = new MongoClient(uri, { serverSelectionTimeoutMS: 10000 });
+    await client.connect();
+    const db = client.db();
+    await db.command({ ping: 1 });
+    mongoDb = db;
+    lastDbError = null;
+
+    // Create indexes non-fatally so pre-existing Mongoose or Atlas indexes never abort cache loading
+    await Promise.all([
+      ensureIndexSafe('users', { uid: 1 }, { unique: true }),
+      ensureIndexSafe('users', { email: 1 }, { unique: true }),
+      ensureIndexSafe('connections', { id: 1 }, { unique: true }),
+      ensureIndexSafe('messages', { id: 1 }, { unique: true }),
+      ensureIndexSafe('messages', { participants: 1, createdAt: -1 }),
+      ensureIndexSafe('notifications', { id: 1 }, { unique: true }),
+      ensureIndexSafe('notifications', { recipientId: 1, createdAt: -1 })
+    ]);
+
+    const [rawUsers, rawConnections, rawMessages, rawNotifications] = await Promise.all([
+      mongoDb.collection('users').find({}).toArray(),
+      mongoDb.collection<Connection>('connections').find({}, { projection: { _id: 0 } }).toArray(),
+      mongoDb.collection<Message>('messages').find({}, { projection: { _id: 0 } }).toArray(),
+      mongoDb.collection<Notification>('notifications').find({}, { projection: { _id: 0 } }).toArray()
+    ]);
+
+    usersCache = rawUsers.map(normalizeUserRecord).filter(u => Boolean(u.uid));
+    connectionsCache = rawConnections;
+    messagesCache = rawMessages;
+    notificationsCache = rawNotifications;
+    console.log(`[MongoDB] Connected to database "${mongoDb.databaseName}". Loaded ${usersCache.length} users, ${connectionsCache.length} connections, ${messagesCache.length} messages and ${notificationsCache.length} notifications.`);
+  } catch (err) {
+    mongoDb = null;
+    lastDbError = err instanceof Error ? err.message : 'MongoDB connection failed';
+    console.error('[MongoDB] Connection error:', lastDbError);
+    throw err;
+  }
 }
-async function saveRecord(collectionName: string, key: string, record: any) {
+
+async function ensureDatabaseConnected(requirePersistentDb: boolean = false) {
+  const uri = getMongoUri();
+  if (!uri) {
+    if (isProd || requirePersistentDb) {
+      throw new DatabaseUnavailableError(
+        lastDbError || 'MongoDB Atlas is not configured on the server (MONGODB_URI missing).'
+      );
+    }
+    return;
+  }
+
+  if (mongoDb) return;
+
+  if (!mongoConnectPromise) {
+    mongoConnectPromise = connectDatabase()
+      .catch(err => {
+        lastDbError = err instanceof Error ? err.message : 'MongoDB connection failed';
+        console.error('[MongoDB] Reconnect attempt failed:', lastDbError);
+      })
+      .finally(() => {
+        mongoConnectPromise = null;
+      });
+  }
+  await mongoConnectPromise;
+
   if (!mongoDb) {
-    const cacheMap: Record<string, unknown[]> = {
+    throw new DatabaseUnavailableError(
+      lastDbError || 'Unable to connect to MongoDB Atlas. Please check database configuration.'
+    );
+  }
+}
+
+async function findUserByEmail(email: string): Promise<User | null> {
+  const normalizedEmail = email.toLowerCase().trim();
+  if (!normalizedEmail) return null;
+
+  await ensureDatabaseConnected(Boolean(getMongoUri()) || isProd);
+
+  if (mongoDb) {
+    let doc = await mongoDb.collection('users').findOne({ email: normalizedEmail });
+    if (!doc) {
+      doc = await mongoDb.collection('users').findOne({
+        email: { $regex: new RegExp(`^\\s*${escapeRegex(normalizedEmail)}\\s*$`, 'i') }
+      });
+    }
+    if (!doc) return null;
+    const normalized = normalizeUserRecord(doc);
+    upsertUserCache(normalized);
+    return normalized;
+  }
+
+  return usersCache.find(u => (u.email || '').toLowerCase().trim() === normalizedEmail) || null;
+}
+
+async function findUserByUid(uid: string): Promise<User | null> {
+  if (!uid) return null;
+
+  await ensureDatabaseConnected(Boolean(getMongoUri()) || isProd);
+
+  if (mongoDb) {
+    const filter = ObjectId.isValid(uid)
+      ? { $or: [{ uid }, { _id: new ObjectId(uid) }] }
+      : { uid };
+    const doc = await mongoDb.collection('users').findOne(filter);
+    if (!doc) return null;
+    const normalized = normalizeUserRecord(doc);
+    upsertUserCache(normalized);
+    return normalized;
+  }
+
+  return usersCache.find(u => u.uid === uid) || null;
+}
+
+async function listUsersFromStore(): Promise<User[]> {
+  await ensureDatabaseConnected(Boolean(getMongoUri()) || isProd);
+
+  if (mongoDb) {
+    const docs = await mongoDb.collection('users').find({}).toArray();
+    const normalized = docs.map(normalizeUserRecord).filter(u => Boolean(u.uid));
+    usersCache = normalized;
+    return normalized;
+  }
+
+  return usersCache;
+}
+
+async function listNotificationsForUserFromStore(userId: string): Promise<Notification[]> {
+  await ensureDatabaseConnected(Boolean(getMongoUri()) || isProd);
+
+  if (mongoDb) {
+    const docs = await mongoDb
+      .collection<Notification>('notifications')
+      .find({ recipientId: userId }, { projection: { _id: 0 } })
+      .sort({ createdAt: -1 })
+      .toArray();
+    return docs;
+  }
+
+  return notificationsCache
+    .filter(n => n.recipientId === userId)
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+}
+
+async function markNotificationReadInStore(notifId: string, userId: string): Promise<Notification | null> {
+  await ensureDatabaseConnected(Boolean(getMongoUri()) || isProd);
+
+  if (mongoDb) {
+    const result = await mongoDb.collection<Notification>('notifications').findOneAndUpdate(
+      { id: notifId, recipientId: userId },
+      { $set: { isRead: true } },
+      { returnDocument: 'after', projection: { _id: 0 } }
+    );
+    if (result) {
+      const idx = notificationsCache.findIndex(n => n.id === notifId && n.recipientId === userId);
+      if (idx >= 0) notificationsCache[idx] = result;
+    }
+    return result || null;
+  }
+
+  const notif = notificationsCache.find(n => n.id === notifId && n.recipientId === userId);
+  if (!notif) return null;
+  notif.isRead = true;
+  writeLocalFallback('notifications', notificationsCache);
+  return notif;
+}
+
+async function markAllNotificationsReadInStore(userId: string): Promise<number> {
+  await ensureDatabaseConnected(Boolean(getMongoUri()) || isProd);
+
+  if (mongoDb) {
+    const res = await mongoDb
+      .collection<Notification>('notifications')
+      .updateMany({ recipientId: userId, isRead: false }, { $set: { isRead: true } });
+    notificationsCache.forEach(n => {
+      if (n.recipientId === userId) n.isRead = true;
+    });
+    return res.modifiedCount || 0;
+  }
+
+  let count = 0;
+  notificationsCache.forEach(n => {
+    if (n.recipientId === userId && !n.isRead) {
+      n.isRead = true;
+      count++;
+    }
+  });
+  if (count > 0) writeLocalFallback('notifications', notificationsCache);
+  return count;
+}
+
+async function listConnectionsForUserFromStore(userId: string): Promise<Connection[]> {
+  await ensureDatabaseConnected(Boolean(getMongoUri()) || isProd);
+
+  if (mongoDb) {
+    return await mongoDb
+      .collection<Connection>('connections')
+      .find({ $or: [{ requesterId: userId }, { recipientId: userId }] }, { projection: { _id: 0 } })
+      .toArray();
+  }
+
+  return connectionsCache.filter(c => c.requesterId === userId || c.recipientId === userId);
+}
+
+async function findConnectionBetweenFromStore(uid1: string, uid2: string): Promise<Connection | null> {
+  await ensureDatabaseConnected(Boolean(getMongoUri()) || isProd);
+
+  if (mongoDb) {
+    return await mongoDb.collection<Connection>('connections').findOne(
+      {
+        $or: [
+          { requesterId: uid1, recipientId: uid2 },
+          { requesterId: uid2, recipientId: uid1 }
+        ]
+      },
+      { projection: { _id: 0 } }
+    );
+  }
+
+  return (
+    connectionsCache.find(
+      c =>
+        (c.requesterId === uid1 && c.recipientId === uid2) ||
+        (c.requesterId === uid2 && c.recipientId === uid1)
+    ) || null
+  );
+}
+
+async function findConnectionByIdFromStore(requestId: string): Promise<Connection | null> {
+  await ensureDatabaseConnected(Boolean(getMongoUri()) || isProd);
+
+  if (mongoDb) {
+    return await mongoDb
+      .collection<Connection>('connections')
+      .findOne({ id: requestId }, { projection: { _id: 0 } });
+  }
+
+  return connectionsCache.find(c => c.id === requestId) || null;
+}
+
+async function listMessagesForUserFromStore(userId: string): Promise<Message[]> {
+  await ensureDatabaseConnected(Boolean(getMongoUri()) || isProd);
+
+  if (mongoDb) {
+    const docs = await mongoDb
+      .collection<Message>('messages')
+      .find(
+        { $or: [{ participants: userId }, { from: userId }, { to: userId }] },
+        { projection: { _id: 0 } }
+      )
+      .sort({ createdAt: 1 })
+      .toArray();
+    return docs;
+  }
+
+  return messagesCache
+    .filter(m => (m.participants && m.participants.includes(userId)) || m.from === userId || m.to === userId)
+    .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+}
+
+async function listConversationMessagesFromStore(uid1: string, uid2: string): Promise<Message[]> {
+  await ensureDatabaseConnected(Boolean(getMongoUri()) || isProd);
+
+  if (mongoDb) {
+    return await mongoDb
+      .collection<Message>('messages')
+      .find(
+        {
+          $or: [
+            { from: uid1, to: uid2 },
+            { from: uid2, to: uid1 }
+          ]
+        },
+        { projection: { _id: 0 } }
+      )
+      .sort({ createdAt: 1 })
+      .toArray();
+  }
+
+  return messagesCache
+    .filter(m => (m.from === uid1 && m.to === uid2) || (m.from === uid2 && m.to === uid1))
+    .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+}
+
+async function saveRecord(collectionName: string, key: string, record: any) {
+  await ensureDatabaseConnected(Boolean(getMongoUri()) || isProd);
+  if (!mongoDb) {
+    const cacheMap: Record<string, any[]> = {
       users: usersCache,
       connections: connectionsCache,
       messages: messagesCache,
       notifications: notificationsCache
     };
-    if (cacheMap[collectionName]) {
-      writeLocalFallback(collectionName, cacheMap[collectionName]);
+    const current = cacheMap[collectionName];
+    if (current) {
+      const idx = current.findIndex(item => item && item[key] === record[key]);
+      const nextList = idx >= 0
+        ? current.map((item, i) => (i === idx ? record : item))
+        : [...current, record];
+      writeLocalFallback(collectionName, nextList);
     }
     return;
   }
   const { _id, ...document } = record;
-  await mongoDb.collection(collectionName).updateOne({ [key]: document[key] }, { $set: document }, { upsert: true });
+  const filter =
+    collectionName === 'users' && key === 'uid' && ObjectId.isValid(String(document.uid || ''))
+      ? { $or: [{ uid: document.uid }, { _id: new ObjectId(String(document.uid)) }] }
+      : { [key]: document[key] };
+  await mongoDb.collection(collectionName).updateOne(filter, { $set: document }, { upsert: true });
 }
+
 async function removeRecord(collectionName: string, key: string, value: string) {
+  await ensureDatabaseConnected(Boolean(getMongoUri()) || isProd);
   if (!mongoDb) {
-    const cacheMap: Record<string, unknown[]> = {
+    const cacheMap: Record<string, any[]> = {
       users: usersCache,
       connections: connectionsCache,
       messages: messagesCache,
       notifications: notificationsCache
     };
-    if (cacheMap[collectionName]) {
-      writeLocalFallback(collectionName, cacheMap[collectionName]);
+    const current = cacheMap[collectionName];
+    if (current) {
+      const nextList = current.filter(item => item && item[key] !== value);
+      writeLocalFallback(collectionName, nextList);
     }
     return;
   }
@@ -154,6 +532,8 @@ interface User {
   avatarPublicId?: string;
   initials: string;
   color?: string;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 function sanitizeUser(u: User, isAuthenticated: boolean = true) {
@@ -278,19 +658,27 @@ io.on('connection', (socket) => {
       createdAt: new Date().toISOString()
     };
 
-    // Save to persistent storage
-    messagesCache.push(message);
-    await saveRecord('messages', 'id', message);
+    try {
+      // Save to persistent storage before confirming delivery
+      await saveRecord('messages', 'id', message);
+      messagesCache.push(message);
 
-    console.log(`[Socket Message] From ${userId} -> ${to} | ID: ${message.id} | "${message.text.substring(0, 30)}..."`);
+      console.log(`[Socket Message] From ${userId} -> ${to} | ID: ${message.id} | "${message.text.substring(0, 30)}..."`);
 
-    // Acknowledge back to sender
-    socket.emit('message_saved', { message, tempId });
+      // Acknowledge back to sender
+      socket.emit('message_saved', { message, tempId });
 
-    // Deliver directly to recipient's private room
-    const recipientRoom = `user:${to}`;
-    io.to(recipientRoom).emit('receive_message', message);
-    console.log(`[Socket Message] Delivered 'receive_message' to room ${recipientRoom}`);
+      // Deliver directly to recipient's private room
+      const recipientRoom = `user:${to}`;
+      io.to(recipientRoom).emit('receive_message', message);
+      console.log(`[Socket Message] Delivered 'receive_message' to room ${recipientRoom}`);
+    } catch (err) {
+      console.error('[Socket Message] Failed to persist message:', err);
+      socket.emit('message_error', {
+        error: err instanceof DatabaseUnavailableError ? err.message : 'Failed to store message in database',
+        tempId
+      });
+    }
   });
 
   socket.on('disconnect', (reason) => {
@@ -317,309 +705,439 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
 
 // ==================== REST API ENDPOINTS ====================
 
-// Health check
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    usersCount: usersCache.length,
-    connectionsCount: connectionsCache.length,
-    messagesCount: messagesCache.length,
-    activeSockets: io.engine.clientsCount
-  });
+// Health check (reports live MongoDB Atlas status & counts without exposing secrets)
+app.get('/api/health', async (req, res) => {
+  try {
+    if (!mongoDb && getMongoUri()) {
+      await ensureDatabaseConnected(false).catch(() => null);
+    }
+
+    const dbMode = isMongoConnected()
+      ? 'mongodb'
+      : !isProd && !getMongoUri()
+        ? 'local-dev-fallback'
+        : 'disconnected';
+
+    let usersCount = usersCache.length;
+    let connectionsCount = connectionsCache.length;
+    let messagesCount = messagesCache.length;
+
+    if (mongoDb) {
+      await mongoDb.command({ ping: 1 });
+      [usersCount, connectionsCount, messagesCount] = await Promise.all([
+        mongoDb.collection('users').countDocuments(),
+        mongoDb.collection('connections').countDocuments(),
+        mongoDb.collection('messages').countDocuments()
+      ]);
+    }
+
+    const healthy = isMongoConnected() || (!isProd && !getMongoUri());
+    res.status(healthy ? 200 : 503).json({
+      status: healthy ? 'ok' : 'degraded',
+      timestamp: new Date().toISOString(),
+      database: {
+        connected: isMongoConnected(),
+        mode: dbMode,
+        databaseName: mongoDb ? mongoDb.databaseName : null,
+        error: lastDbError
+      },
+      usersCount,
+      connectionsCount,
+      messagesCount,
+      activeSockets: io.engine.clientsCount
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Health check database failure';
+    lastDbError = message;
+    res.status(503).json({
+      status: 'degraded',
+      timestamp: new Date().toISOString(),
+      database: {
+        connected: false,
+        mode: 'disconnected',
+        databaseName: null,
+        error: message
+      },
+      usersCount: 0,
+      connectionsCount: 0,
+      messagesCount: 0,
+      activeSockets: io.engine.clientsCount
+    });
+  }
 });
 
 // ==================== AUTHENTICATION ENDPOINTS ====================
 
 // Register new student account
 app.post('/api/auth/register', async (req, res) => {
-  const { name, email, password, branch, year, bio, skills } = req.body;
+  try {
+    const { name, email, password, branch, year, bio, skills } = req.body || {};
 
-  if (!name || !name.trim()) {
-    return res.status(400).json({ error: 'Full name is required' });
-  }
-  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return res.status(400).json({ error: 'A valid collegiate email is required' });
-  }
-  if (!password || password.length < 6) {
-    return res.status(400).json({ error: 'Password must be at least 6 characters' });
-  }
-
-  const normalizedEmail = email.toLowerCase().trim();
-  const existing = usersCache.find(u => u.email.toLowerCase() === normalizedEmail);
-  if (existing) {
-    return res.status(409).json({ error: 'An account with this email already exists' });
-  }
-
-  const passwordHash = await bcrypt.hash(password, 10);
-  const initials = name.trim().split(' ').map((n: string) => n[0]).join('').slice(0, 2).toUpperCase();
-  const colors = ['#4F46E5', '#059669', '#DB2777', '#D97706', '#7C3AED', '#2563EB'];
-  const color = colors[Math.floor(Math.random() * colors.length)];
-
-  const newUser: User = {
-    uid: 'user_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
-    name: name.trim(),
-    email: normalizedEmail,
-    passwordHash,
-    branch: branch || 'Computer Science & Engineering',
-    year: year || '1st Year',
-    bio: bio || 'Campus Connect Student',
-    skills: Array.isArray(skills) && skills.length > 0 ? skills : [],
-    initials: initials || 'CC',
-    color
-  };
-
-  // 1. Save new student in database
-  usersCache.push(newUser);
-  await saveRecord('users', 'uid', newUser);
-
-  // 2. Notify all existing registered students (excluding the new student)
-  const existingUsers = usersCache.filter(u => u.uid !== newUser.uid);
-  const now = new Date().toISOString();
-
-  for (const existingUser of existingUsers) {
-    // Prevent duplicate notifications
-    const alreadyNotified = notificationsCache.some(
-      n => n.recipientId === existingUser.uid && 
-           n.type === 'new_student_registration' && 
-           n.relatedUserId === newUser.uid
-    );
-    if (!alreadyNotified) {
-      const notif: Notification = {
-        id: 'notif_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9),
-        recipientId: existingUser.uid,
-        senderId: newUser.uid,
-        senderName: newUser.name,
-        senderAvatarUrl: newUser.avatarUrl || '',
-        senderInitials: newUser.initials || 'CC',
-        type: 'new_student_registration',
-        message: `🎉 ${newUser.name} just joined Campus Connect! Welcome your new campus mate.`,
-        relatedUserId: newUser.uid,
-        isRead: false,
-        createdAt: now
-      };
-      notificationsCache.push(notif);
-      await saveRecord('notifications', 'id', notif);
-
-      // Real-time delivery via Socket.io to online user
-      io.to(`user:${existingUser.uid}`).emit('receive_notification', notif);
-      console.log(`[Notification] Delivered new student registration alert to user:${existingUser.uid}`);
+    if (typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ error: 'Full name is required' });
     }
+    if (typeof email !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      return res.status(400).json({ error: 'A valid collegiate email is required' });
+    }
+    if (typeof password !== 'string' || password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const existing = await findUserByEmail(normalizedEmail);
+    if (existing) {
+      return res.status(409).json({ error: 'An account with this email already exists' });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const trimmedName = name.trim();
+    const initials = trimmedName.split(/\s+/).filter(Boolean).map((n: string) => n[0]).join('').slice(0, 2).toUpperCase();
+    const colors = ['#4F46E5', '#059669', '#DB2777', '#D97706', '#7C3AED', '#2563EB'];
+    const color = colors[Math.floor(Math.random() * colors.length)];
+
+    const now = new Date().toISOString();
+    const newUser: User = {
+      uid: 'user_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
+      name: trimmedName,
+      email: normalizedEmail,
+      passwordHash,
+      branch: typeof branch === 'string' && branch.trim() ? branch.trim() : 'Computer Science & Engineering',
+      year: typeof year === 'string' && year.trim() ? year.trim() : '1st Year',
+      bio: typeof bio === 'string' && bio.trim() ? bio.trim() : 'Campus Connect Student',
+      skills: Array.isArray(skills) && skills.length > 0 ? skills : [],
+      initials: initials || 'CC',
+      color,
+      createdAt: now,
+      updatedAt: now
+    };
+
+    // 1. Save new student in database first (never keep unpersisted cache entries if DB write fails)
+    try {
+      await saveRecord('users', 'uid', newUser);
+      upsertUserCache(newUser);
+    } catch (saveErr: any) {
+      if (saveErr?.code === 11000) {
+        return res.status(409).json({ error: 'An account with this email already exists' });
+      }
+      throw saveErr;
+    }
+
+    // 2. Notify all existing registered students (excluding the new student)
+    const allUsers = await listUsersFromStore();
+    const existingUsers = allUsers.filter(u => u.uid !== newUser.uid);
+
+    for (const existingUser of existingUsers) {
+      const existingNotifs = await listNotificationsForUserFromStore(existingUser.uid);
+      const alreadyNotified = existingNotifs.some(
+        n => n.type === 'new_student_registration' && n.relatedUserId === newUser.uid
+      );
+      if (!alreadyNotified) {
+        const notif: Notification = {
+          id: 'notif_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9),
+          recipientId: existingUser.uid,
+          senderId: newUser.uid,
+          senderName: newUser.name,
+          senderAvatarUrl: newUser.avatarUrl || '',
+          senderInitials: newUser.initials || 'CC',
+          type: 'new_student_registration',
+          message: `🎉 ${newUser.name} just joined Campus Connect! Welcome your new campus mate.`,
+          relatedUserId: newUser.uid,
+          isRead: false,
+          createdAt: now
+        };
+        await saveRecord('notifications', 'id', notif);
+        notificationsCache.push(notif);
+
+        // Real-time delivery via Socket.io to online user
+        io.to(`user:${existingUser.uid}`).emit('receive_notification', notif);
+        console.log(`[Notification] Delivered new student registration alert to user:${existingUser.uid}`);
+      }
+    }
+
+    // 3. Broadcast real-time student directory update
+    io.emit('user_registered', {
+      user: sanitizeUser(newUser, false),
+      timestamp: now
+    });
+
+    const token = jwt.sign(
+      { uid: newUser.uid, name: newUser.name, email: newUser.email },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.status(201).json({
+      token,
+      user: sanitizeUser(newUser, true)
+    });
+  } catch (err) {
+    console.error('[Auth] Registration error:', err);
+    if (err instanceof DatabaseUnavailableError) {
+      return res.status(503).json({ error: err.message });
+    }
+    res.status(500).json({ error: 'Unable to complete registration. Please try again.' });
   }
-
-  // 3. Broadcast real-time student directory update
-  io.emit('user_registered', {
-    user: sanitizeUser(newUser, false),
-    timestamp: now
-  });
-
-  const token = jwt.sign(
-    { uid: newUser.uid, name: newUser.name, email: newUser.email },
-    JWT_SECRET,
-    { expiresIn: '7d' }
-  );
-
-  res.status(201).json({
-    token,
-    user: sanitizeUser(newUser, true)
-  });
 });
 
 // ==================== NOTIFICATIONS ENDPOINTS ====================
 
 // List notifications for authenticated user
-app.get('/api/notifications', requireAuth, (req, res) => {
-  const userId = (req as any).user.uid;
-  const userNotifs = notificationsCache
-    .filter(n => n.recipientId === userId)
-    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-  res.json(userNotifs);
+app.get('/api/notifications', requireAuth, async (req, res) => {
+  try {
+    const userId = (req as any).user.uid;
+    const userNotifs = await listNotificationsForUserFromStore(userId);
+    res.json(userNotifs);
+  } catch (err) {
+    console.error('[Notifications] List error:', err);
+    res.status(err instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: err instanceof DatabaseUnavailableError ? err.message : 'Failed to load notifications'
+    });
+  }
 });
 
 // Mark single notification as read
 app.patch('/api/notifications/:id/read', requireAuth, async (req, res) => {
-  const userId = (req as any).user.uid;
-  const notifId = req.params.id;
-
-  const notif = notificationsCache.find(n => n.id === notifId && n.recipientId === userId);
-  if (!notif) {
-    return res.status(404).json({ error: 'Notification not found' });
+  try {
+    const userId = (req as any).user.uid;
+    const notifId = req.params.id;
+    const notif = await markNotificationReadInStore(notifId, userId);
+    if (!notif) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+    res.json(notif);
+  } catch (err) {
+    console.error('[Notifications] Mark read error:', err);
+    res.status(err instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: err instanceof DatabaseUnavailableError ? err.message : 'Failed to update notification'
+    });
   }
-
-  notif.isRead = true;
-  await saveRecord('notifications', 'id', notif);
-  res.json(notif);
 });
 
 // Mark all notifications as read
 app.post('/api/notifications/read-all', requireAuth, async (req, res) => {
-  const userId = (req as any).user.uid;
-  let count = 0;
-
-  notificationsCache.forEach(n => {
-    if (n.recipientId === userId && !n.isRead) {
-      n.isRead = true;
-      count++;
-    }
-  });
-
-  if (count > 0) {
-    await Promise.all(notificationsCache.filter(n => n.recipientId === userId && n.isRead).map(n => saveRecord('notifications', 'id', n)));
+  try {
+    const userId = (req as any).user.uid;
+    const count = await markAllNotificationsReadInStore(userId);
+    res.json({ success: true, markedCount: count });
+  } catch (err) {
+    console.error('[Notifications] Mark all read error:', err);
+    res.status(err instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: err instanceof DatabaseUnavailableError ? err.message : 'Failed to update notifications'
+    });
   }
-
-  res.json({ success: true, markedCount: count });
 });
 
 // Login with email and password
 app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required' });
+  try {
+    const { email, password } = req.body || {};
+    if (typeof email !== 'string' || typeof password !== 'string' || !email.trim() || !password) {
+      return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await findUserByEmail(normalizedEmail);
+    if (!user) {
+      return res.status(401).json({ error: 'No account found with this email address' });
+    }
+
+    if (!user.passwordHash || typeof user.passwordHash !== 'string') {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const match = await bcrypt.compare(password, user.passwordHash);
+    if (!match) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const token = jwt.sign(
+      { uid: user.uid, name: user.name, email: user.email },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    const resPayload = {
+      token,
+      user: sanitizeUser(user, true)
+    };
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(resPayload);
+  } catch (err) {
+    console.error('[Auth] Login error:', err);
+    res.status(err instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: err instanceof DatabaseUnavailableError ? err.message : 'Unable to log in right now. Please try again.'
+    });
   }
-
-  const normalizedEmail = email.toLowerCase().trim();
-  const user = usersCache.find(u => u.email.toLowerCase() === normalizedEmail);
-  if (!user) {
-    return res.status(401).json({ error: 'Invalid email or password' });
-  }
-
-  let match = false;
-  if (user.passwordHash) {
-    match = await bcrypt.compare(password, user.passwordHash);
-  } else {
-    // For default seed accounts, verify password123
-    match = (password === 'password123');
-  }
-
-  if (!match) {
-    return res.status(401).json({ error: 'Invalid email or password' });
-  }
-
-  const token = jwt.sign(
-    { uid: user.uid, name: user.name, email: user.email },
-    JWT_SECRET,
-    { expiresIn: '7d' }
-  );
-
-  res.json({
-    token,
-    user: sanitizeUser(user, true)
-  });
 });
 
 // Get currently authenticated student profile
-app.get('/api/auth/me', requireAuth, (req, res) => {
-  const userId = (req as any).user.uid;
-  const user = usersCache.find(u => u.uid === userId);
-  if (!user) {
-    return res.status(404).json({ error: 'Student not found' });
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+  try {
+    const userId = (req as any).user.uid;
+    const user = await findUserByUid(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(sanitizeUser(user, true));
+  } catch (err) {
+    console.error('[Auth] Fetch profile error:', err);
+    res.status(err instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: err instanceof DatabaseUnavailableError ? err.message : 'Failed to verify session'
+    });
   }
-  res.json(sanitizeUser(user, true));
 });
 
-// Issue JWT Token for quick persona session
-app.post('/api/auth/token', (req, res) => {
-  const { uid, name, email } = req.body;
-  if (!uid) {
-    return res.status(400).json({ error: 'Student UID is required' });
+// Issue JWT Token for verified registered student session
+app.post('/api/auth/token', async (req, res) => {
+  try {
+    const { uid, name, email } = req.body || {};
+    if (typeof uid !== 'string' || !uid.trim()) {
+      return res.status(400).json({ error: 'Student UID is required' });
+    }
+
+    const user = await findUserByUid(uid.trim());
+    if (!user) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    const studentName = user.name || name || 'Student';
+    const studentEmail = user.email || email || '';
+
+    const token = jwt.sign(
+      { uid: user.uid, name: studentName, email: studentEmail },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.json({ token, uid: user.uid, name: studentName, email: studentEmail });
+  } catch (err) {
+    console.error('[Auth] Token error:', err);
+    res.status(err instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: err instanceof DatabaseUnavailableError ? err.message : 'Failed to issue session token'
+    });
   }
-
-  const user = usersCache.find(u => u.uid === uid);
-  const studentName = user?.name || name || 'Student';
-  const studentEmail = user?.email || email || '';
-
-  const token = jwt.sign(
-    { uid, name: studentName, email: studentEmail },
-    JWT_SECRET,
-    { expiresIn: '7d' }
-  );
-
-  res.json({ token, uid, name: studentName, email: studentEmail });
 });
 
 // ==================== USERS ENDPOINTS ====================
 
 // USERS: List all students (masked as "User" for anonymous visitors, real names for authenticated students)
-app.get('/api/users', (req, res) => {
-  let authenticatedUid: string | null = null;
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    try {
-      const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET) as { uid: string };
-      authenticatedUid = decoded.uid;
-    } catch {
-      authenticatedUid = null;
+app.get('/api/users', async (req, res) => {
+  try {
+    let authenticatedUid: string | null = null;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      try {
+        const decoded = jwt.verify(authHeader.split(' ')[1], JWT_SECRET) as { uid: string };
+        authenticatedUid = decoded.uid;
+      } catch {
+        authenticatedUid = null;
+      }
     }
-  }
 
-  if (authenticatedUid) {
-    // Authenticated: show real names and exclude the current student from their own discover results
-    const list = usersCache
-      .filter(u => u.uid !== authenticatedUid)
-      .map(u => sanitizeUser(u, true));
-    return res.json(list);
-  }
+    const allUsers = await listUsersFromStore();
+    res.setHeader('Cache-Control', 'no-store');
 
-  // Anonymous visitor: mask names as "User", hide email and private bio
-  const anonymousList = usersCache.map(u => sanitizeUser(u, false));
-  res.json(anonymousList);
+    if (authenticatedUid) {
+      // Authenticated: show real names and exclude the current student from their own discover results
+      const list = allUsers
+        .filter(u => u.uid !== authenticatedUid)
+        .map(u => sanitizeUser(u, true));
+      return res.json(list);
+    }
+
+    // Anonymous visitor: mask names as "User", hide email and private bio
+    const anonymousList = allUsers.map(u => sanitizeUser(u, false));
+    res.json(anonymousList);
+  } catch (err) {
+    console.error('[Users] List error:', err);
+    res.status(err instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: err instanceof DatabaseUnavailableError ? err.message : 'Failed to load students'
+    });
+  }
 });
 
 // USERS: Get single student by ID
-app.get('/api/users/:id', (req, res) => {
-  let isAuthenticated = false;
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    try {
-      jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
-      isAuthenticated = true;
-    } catch {
-      isAuthenticated = false;
+app.get('/api/users/:id', async (req, res) => {
+  try {
+    let isAuthenticated = false;
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      try {
+        jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
+        isAuthenticated = true;
+      } catch {
+        isAuthenticated = false;
+      }
     }
-  }
 
-  const user = usersCache.find(u => u.uid === req.params.id);
-  if (!user) {
-    return res.status(404).json({ error: 'Student not found' });
-  }
+    const user = await findUserByUid(req.params.id);
+    if (!user) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
 
-  res.json(sanitizeUser(user, isAuthenticated));
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(sanitizeUser(user, isAuthenticated));
+  } catch (err) {
+    console.error('[Users] Get single error:', err);
+    res.status(err instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: err instanceof DatabaseUnavailableError ? err.message : 'Failed to load student profile'
+    });
+  }
 });
 
 // USERS: Update current user's profile
 app.put('/api/users/me', requireAuth, async (req, res) => {
-  const userId = (req as any).user.uid;
-  const { name, branch, year, bio, skills, avatarUrl } = req.body;
+  try {
+    const userId = (req as any).user.uid;
+    const { name, branch, year, bio, skills, avatarUrl } = req.body || {};
 
-  let userIndex = usersCache.findIndex(u => u.uid === userId);
-  if (userIndex >= 0) {
-    usersCache[userIndex] = {
-      ...usersCache[userIndex],
-      ...(name && { name }),
-      ...(branch && { branch }),
-      ...(year && { year }),
-      ...(bio !== undefined && { bio }),
-      ...(skills && { skills }),
-      ...(avatarUrl && { avatarUrl }),
+    const existingUser = await findUserByUid(userId);
+    if (!existingUser) {
+      return res.status(404).json({ error: 'Student account not found' });
+    }
+
+    const nextName = typeof name === 'string' && name.trim() ? name.trim() : existingUser.name;
+    const nextInitials =
+      nextName
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((n: string) => n[0])
+        .join('')
+        .slice(0, 2)
+        .toUpperCase() || existingUser.initials;
+
+    const updatedUser: User = {
+      ...existingUser,
+      name: nextName,
+      initials: nextInitials,
+      ...(typeof branch === 'string' && branch.trim() ? { branch: branch.trim() } : {}),
+      ...(typeof year === 'string' && year.trim() ? { year: year.trim() } : {}),
+      ...(bio !== undefined ? { bio: String(bio) } : {}),
+      ...(Array.isArray(skills) ? { skills: skills.filter(s => typeof s === 'string' && s.trim()).map(s => s.trim()) } : {}),
+      ...(typeof avatarUrl === 'string' ? { avatarUrl } : {}),
+      updatedAt: new Date().toISOString()
     };
-  } else {
-    // Create new profile record
-    const newUser: User = {
+
+    await saveRecord('users', 'uid', updatedUser);
+    upsertUserCache(updatedUser);
+    io.emit('user_updated', {
       uid: userId,
-      name: name || 'Student',
-      email: (req as any).user.email || '',
-      branch: branch || 'Computer Science',
-      year: year || '3rd Year',
-      bio: bio || '',
-      skills: skills || ['React', 'JavaScript'],
-      initials: (name || 'ST').split(' ').map((n: string) => n[0]).join('').slice(0, 2).toUpperCase()
-    };
-    usersCache.push(newUser);
-    userIndex = usersCache.length - 1;
+      name: updatedUser.name,
+      branch: updatedUser.branch,
+      year: updatedUser.year,
+      bio: updatedUser.bio,
+      skills: updatedUser.skills,
+      avatarUrl: updatedUser.avatarUrl || '',
+      initials: updatedUser.initials
+    });
+    res.json(sanitizeUser(updatedUser, true));
+  } catch (err) {
+    console.error('[Users] Update profile error:', err);
+    res.status(err instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: err instanceof DatabaseUnavailableError ? err.message : 'Failed to update student profile'
+    });
   }
-
-  await saveRecord('users', 'uid', usersCache[userIndex]);
-  res.json(sanitizeUser(usersCache[userIndex], true));
 });
 
 // Avatar images are stored in Cloudinary, not on the Render instance filesystem.
@@ -668,232 +1186,324 @@ app.post('/api/users/me/avatar', requireAuth, (req: Request, res: Response) => {
     }
     if (!req.file) return res.status(400).json({ error: 'No image file was provided.' });
 
-    const userId = (req as any).user.uid;
-    const userIndex = usersCache.findIndex(u => u.uid === userId);
-    if (userIndex === -1) return res.status(404).json({ error: 'Student account not found' });
-
     try {
-      const uploaded = await uploadAvatar(req.file.buffer, userId);
-      const oldPublicId = usersCache[userIndex].avatarPublicId;
-      usersCache[userIndex].avatarUrl = uploaded.url;
-      usersCache[userIndex].avatarPublicId = uploaded.publicId;
-      await saveRecord('users', 'uid', usersCache[userIndex]);
+      const userId = (req as any).user.uid;
+      const user = await findUserByUid(userId);
+      if (!user) return res.status(404).json({ error: 'Student account not found' });
+
+      let uploaded: { url: string; publicId: string };
+      try {
+        uploaded = await uploadAvatar(req.file.buffer, userId);
+      } catch (uploadError) {
+        console.error('[Avatar Upload] Storage failed:', uploadError);
+        return res.status(502).json({ error: 'Could not store profile picture. Please try again.' });
+      }
+
+      const oldPublicId = user.avatarPublicId;
+      const updatedUser = {
+        ...user,
+        avatarUrl: uploaded.url,
+        avatarPublicId: uploaded.publicId,
+        updatedAt: new Date().toISOString()
+      };
+
+      await saveRecord('users', 'uid', updatedUser);
+      upsertUserCache(updatedUser);
+
       if (oldPublicId) await cloudinary.uploader.destroy(oldPublicId).catch(() => null);
       io.emit('user_updated', { uid: userId, avatarUrl: uploaded.url });
       res.json({
         success: true,
         message: 'Profile picture uploaded successfully',
         avatarUrl: uploaded.url,
-        user: sanitizeUser(usersCache[userIndex], true)
+        user: sanitizeUser(updatedUser, true)
       });
-    } catch (uploadError) {
-      console.error('[Avatar Upload] Failed:', uploadError);
-      res.status(502).json({ error: 'Could not store profile picture. Please try again.' });
+    } catch (dbErr) {
+      console.error('[Avatar Upload] Database error:', dbErr);
+      res.status(dbErr instanceof DatabaseUnavailableError ? 503 : 500).json({
+        error: dbErr instanceof DatabaseUnavailableError ? dbErr.message : 'Failed to save profile picture.'
+      });
     }
   });
 });
 
 app.delete('/api/users/me/avatar', requireAuth, async (req: Request, res: Response) => {
-  const userId = (req as any).user.uid;
-  const userIndex = usersCache.findIndex(u => u.uid === userId);
-  if (userIndex === -1) return res.status(404).json({ error: 'Student account not found' });
-  const oldPublicId = usersCache[userIndex].avatarPublicId;
-  if (oldPublicId) {
-    try {
-      configureCloudinary();
-      await cloudinary.uploader.destroy(oldPublicId);
-    } catch (error) {
-      console.warn('[Avatar Remove] Cloudinary cleanup failed:', error);
+  try {
+    const userId = (req as any).user.uid;
+    const user = await findUserByUid(userId);
+    if (!user) return res.status(404).json({ error: 'Student account not found' });
+
+    const oldPublicId = user.avatarPublicId;
+    const updatedUser = {
+      ...user,
+      avatarUrl: '',
+      avatarPublicId: '',
+      updatedAt: new Date().toISOString()
+    };
+
+    await saveRecord('users', 'uid', updatedUser);
+    upsertUserCache(updatedUser);
+
+    if (oldPublicId) {
+      try {
+        configureCloudinary();
+        await cloudinary.uploader.destroy(oldPublicId);
+      } catch (error) {
+        console.warn('[Avatar Remove] Cloudinary cleanup failed:', error);
+      }
     }
+
+    io.emit('user_updated', { uid: userId, avatarUrl: '' });
+    res.json({
+      success: true,
+      message: 'Profile picture removed successfully',
+      avatarUrl: '',
+      user: sanitizeUser(updatedUser, true)
+    });
+  } catch (dbErr) {
+    console.error('[Avatar Remove] Database error:', dbErr);
+    res.status(dbErr instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: dbErr instanceof DatabaseUnavailableError ? dbErr.message : 'Failed to remove profile picture.'
+    });
   }
-  usersCache[userIndex].avatarUrl = '';
-  usersCache[userIndex].avatarPublicId = '';
-  await saveRecord('users', 'uid', usersCache[userIndex]);
-  io.emit('user_updated', { uid: userId, avatarUrl: '' });
-  res.json({
-    success: true,
-    message: 'Profile picture removed successfully',
-    avatarUrl: '',
-    user: sanitizeUser(usersCache[userIndex], true)
-  });
 });
 
 // CONNECTIONS: Get connections for current user
-app.get('/api/connections', requireAuth, (req, res) => {
-  const userId = (req as any).user.uid;
-  const userConnections = connectionsCache.filter(
-    c => c.requesterId === userId || c.recipientId === userId
-  );
-  res.json(userConnections);
+app.get('/api/connections', requireAuth, async (req, res) => {
+  try {
+    const userId = (req as any).user.uid;
+    const userConnections = await listConnectionsForUserFromStore(userId);
+    res.json(userConnections);
+  } catch (err) {
+    console.error('[Connections] List error:', err);
+    res.status(err instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: err instanceof DatabaseUnavailableError ? err.message : 'Failed to load connections'
+    });
+  }
 });
 
 // CONNECTIONS: Send connection request
 app.post('/api/connections/:userId', requireAuth, async (req, res) => {
-  const requesterId = (req as any).user.uid;
-  const recipientId = req.params.userId;
-  const requesterUser = usersCache.find(u => u.uid === requesterId);
-  const recipientUser = usersCache.find(u => u.uid === recipientId);
+  try {
+    const requesterId = (req as any).user.uid;
+    const recipientId = req.params.userId;
+    if (recipientId === requesterId) {
+      return res.status(400).json({ error: 'Cannot connect with yourself' });
+    }
 
-  if (recipientId === requesterId) {
-    return res.status(400).json({ error: 'Cannot connect with yourself' });
+    const [requesterUser, recipientUser, existing] = await Promise.all([
+      findUserByUid(requesterId),
+      findUserByUid(recipientId),
+      findConnectionBetweenFromStore(requesterId, recipientId)
+    ]);
+
+    if (existing) {
+      return res.status(400).json({ error: 'Connection request already exists', connection: existing });
+    }
+
+    const newConn: Connection = {
+      id: 'conn_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
+      requesterId,
+      recipientId,
+      requesterName: requesterUser?.name || 'Student',
+      recipientName: recipientUser?.name || 'Student',
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    await saveRecord('connections', 'id', newConn);
+    connectionsCache.push(newConn);
+
+    // Notify recipient via socket if connected
+    io.to(`user:${recipientId}`).emit('connection_updated', newConn);
+
+    res.status(201).json(newConn);
+  } catch (err) {
+    console.error('[Connections] Create error:', err);
+    res.status(err instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: err instanceof DatabaseUnavailableError ? err.message : 'Failed to send connection request'
+    });
   }
-
-  // Check if connection already exists
-  const existing = connectionsCache.find(
-    c => (c.requesterId === requesterId && c.recipientId === recipientId) ||
-         (c.requesterId === recipientId && c.recipientId === requesterId)
-  );
-
-  if (existing) {
-    return res.status(400).json({ error: 'Connection request already exists', connection: existing });
-  }
-
-  const newConn: Connection = {
-    id: 'conn_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
-    requesterId,
-    recipientId,
-    requesterName: requesterUser?.name || 'Student',
-    recipientName: recipientUser?.name || 'Student',
-    status: 'pending',
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
-  };
-
-  connectionsCache.push(newConn);
-  await saveRecord('connections', 'id', newConn);
-
-  // Notify recipient via socket if connected
-  io.to(`user:${recipientId}`).emit('connection_updated', newConn);
-
-  res.status(201).json(newConn);
 });
 
 // CONNECTIONS: Accept or update request
 app.put('/api/connections/:requestId', requireAuth, async (req, res) => {
-  const userId = (req as any).user.uid;
-  const { status } = req.body;
-  const requestId = req.params.requestId;
+  try {
+    const userId = (req as any).user.uid;
+    const { status } = req.body || {};
+    const requestId = req.params.requestId;
 
-  const conn = connectionsCache.find(c => c.id === requestId);
-  if (!conn) {
-    return res.status(404).json({ error: 'Connection request not found' });
+    const conn = await findConnectionByIdFromStore(requestId);
+    if (!conn) {
+      return res.status(404).json({ error: 'Connection request not found' });
+    }
+
+    if (conn.recipientId !== userId && conn.requesterId !== userId) {
+      return res.status(403).json({ error: 'Unauthorized to modify this connection' });
+    }
+
+    const updatedConn: Connection = {
+      ...conn,
+      status: status === 'rejected' ? 'rejected' : status === 'pending' ? 'pending' : 'accepted',
+      updatedAt: new Date().toISOString()
+    };
+    await saveRecord('connections', 'id', updatedConn);
+    const idx = connectionsCache.findIndex(c => c.id === requestId);
+    if (idx >= 0) connectionsCache[idx] = updatedConn;
+    else connectionsCache.push(updatedConn);
+
+    // Notify both participants in real time
+    io.to(`user:${updatedConn.requesterId}`).emit('connection_updated', updatedConn);
+    io.to(`user:${updatedConn.recipientId}`).emit('connection_updated', updatedConn);
+
+    res.json(updatedConn);
+  } catch (err) {
+    console.error('[Connections] Update error:', err);
+    res.status(err instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: err instanceof DatabaseUnavailableError ? err.message : 'Failed to update connection request'
+    });
   }
-
-  if (conn.recipientId !== userId && conn.requesterId !== userId) {
-    return res.status(403).json({ error: 'Unauthorized to modify this connection' });
-  }
-
-  conn.status = status || 'accepted';
-  conn.updatedAt = new Date().toISOString();
-  await saveRecord('connections', 'id', conn);
-
-  // Notify both participants in real time
-  io.to(`user:${conn.requesterId}`).emit('connection_updated', conn);
-  io.to(`user:${conn.recipientId}`).emit('connection_updated', conn);
-
-  res.json(conn);
 });
 
 // CONNECTIONS: Delete or reject connection
 app.delete('/api/connections/:requestId', requireAuth, async (req, res) => {
-  const userId = (req as any).user.uid;
-  const requestId = req.params.requestId;
+  try {
+    const userId = (req as any).user.uid;
+    const requestId = req.params.requestId;
 
-  const connIndex = connectionsCache.findIndex(c => c.id === requestId);
-  if (connIndex === -1) {
-    return res.status(404).json({ error: 'Connection not found' });
+    const conn = await findConnectionByIdFromStore(requestId);
+    if (!conn) {
+      return res.status(404).json({ error: 'Connection not found' });
+    }
+
+    if (conn.recipientId !== userId && conn.requesterId !== userId) {
+      return res.status(403).json({ error: 'Unauthorized to delete this connection' });
+    }
+
+    await removeRecord('connections', 'id', requestId);
+    connectionsCache = connectionsCache.filter(c => c.id !== requestId);
+
+    // Notify both participants in real time
+    io.to(`user:${conn.requesterId}`).emit('connection_removed', { id: requestId });
+    io.to(`user:${conn.recipientId}`).emit('connection_removed', { id: requestId });
+
+    res.json({ success: true, id: requestId });
+  } catch (err) {
+    console.error('[Connections] Delete error:', err);
+    res.status(err instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: err instanceof DatabaseUnavailableError ? err.message : 'Failed to delete connection'
+    });
   }
+});
 
-  const conn = connectionsCache[connIndex];
-  if (conn.recipientId !== userId && conn.requesterId !== userId) {
-    return res.status(403).json({ error: 'Unauthorized to delete this connection' });
+// MESSAGES: Get all persisted messages for the authenticated student
+app.get('/api/messages', requireAuth, async (req, res) => {
+  try {
+    const userId = (req as any).user.uid;
+    const userMessages = await listMessagesForUserFromStore(userId);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(userMessages);
+  } catch (err) {
+    console.error('[Messages] List all error:', err);
+    res.status(err instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: err instanceof DatabaseUnavailableError ? err.message : 'Failed to load messages'
+    });
   }
-
-  connectionsCache.splice(connIndex, 1);
-  await removeRecord('connections', 'id', requestId);
-
-  // Notify both participants in real time
-  io.to(`user:${conn.requesterId}`).emit('connection_removed', { id: requestId });
-  io.to(`user:${conn.recipientId}`).emit('connection_removed', { id: requestId });
-
-  res.json({ success: true, id: requestId });
 });
 
 // MESSAGES: Get active conversation previews
-app.get('/api/messages/conversations', requireAuth, (req, res) => {
-  const userId = (req as any).user.uid;
-  const userMessages = messagesCache.filter(m => m.participants && m.participants.includes(userId));
+app.get('/api/messages/conversations', requireAuth, async (req, res) => {
+  try {
+    const userId = (req as any).user.uid;
+    const userMessages = await listMessagesForUserFromStore(userId);
 
-  const convMap: { [peerId: string]: { peerId: string; lastMessage: Message } } = {};
+    const convMap: { [peerId: string]: { peerId: string; lastMessage: Message } } = {};
 
-  userMessages.forEach(m => {
-    const peerId = m.from === userId ? m.to : m.from;
-    if (!peerId) return;
+    userMessages.forEach(m => {
+      const peerId = m.from === userId ? m.to : m.from;
+      if (!peerId) return;
 
-    if (!convMap[peerId] || new Date(m.createdAt) > new Date(convMap[peerId].lastMessage.createdAt)) {
-      convMap[peerId] = {
-        peerId,
-        lastMessage: m
-      };
-    }
-  });
+      if (!convMap[peerId] || new Date(m.createdAt) > new Date(convMap[peerId].lastMessage.createdAt)) {
+        convMap[peerId] = {
+          peerId,
+          lastMessage: m
+        };
+      }
+    });
 
-  const sorted = Object.values(convMap).sort((a, b) => 
-    new Date(b.lastMessage.createdAt).getTime() - new Date(a.lastMessage.createdAt).getTime()
-  );
+    const sorted = Object.values(convMap).sort((a, b) =>
+      new Date(b.lastMessage.createdAt).getTime() - new Date(a.lastMessage.createdAt).getTime()
+    );
 
-  res.json(sorted);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(sorted);
+  } catch (err) {
+    console.error('[Messages] Conversations error:', err);
+    res.status(err instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: err instanceof DatabaseUnavailableError ? err.message : 'Failed to load conversations'
+    });
+  }
 });
 
 // MESSAGES: Get full bidirectional message history between current user and peer
-app.get('/api/messages/:userId', requireAuth, (req, res) => {
-  const currentUserId = (req as any).user.uid;
-  const targetUserId = req.params.userId;
+app.get('/api/messages/:userId', requireAuth, async (req, res) => {
+  try {
+    const currentUserId = (req as any).user.uid;
+    const targetUserId = req.params.userId;
 
-  if (!targetUserId) {
-    return res.status(400).json({ error: 'Target user ID is required' });
+    if (!targetUserId) {
+      return res.status(400).json({ error: 'Target user ID is required' });
+    }
+
+    const conversation = await listConversationMessagesFromStore(currentUserId, targetUserId);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(conversation);
+  } catch (err) {
+    console.error('[Messages] Conversation history error:', err);
+    res.status(err instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: err instanceof DatabaseUnavailableError ? err.message : 'Failed to load conversation history'
+    });
   }
-
-  const conversation = messagesCache.filter(m => 
-    (m.from === currentUserId && m.to === targetUserId) ||
-    (m.from === targetUserId && m.to === currentUserId)
-  );
-
-  conversation.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
-
-  res.json(conversation);
 });
 
 // MESSAGES: REST fallback to send message
 app.post('/api/messages/:userId', requireAuth, async (req, res) => {
-  const currentUserId = (req as any).user.uid;
-  const targetUserId = req.params.userId;
-  const { text } = req.body;
+  try {
+    const currentUserId = (req as any).user.uid;
+    const targetUserId = req.params.userId;
+    const { text } = req.body || {};
 
-  if (!text || !text.trim()) {
-    return res.status(400).json({ error: 'Message text is required' });
+    if (typeof text !== 'string' || !text.trim()) {
+      return res.status(400).json({ error: 'Message text is required' });
+    }
+
+    if (targetUserId === currentUserId) {
+      return res.status(400).json({ error: 'Cannot send message to yourself' });
+    }
+
+    const message: Message = {
+      id: 'msg_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9),
+      from: currentUserId,
+      to: targetUserId,
+      participants: [currentUserId, targetUserId].sort(),
+      text: text.trim(),
+      createdAt: new Date().toISOString()
+    };
+
+    await saveRecord('messages', 'id', message);
+    messagesCache.push(message);
+
+    // Deliver via Socket.io to recipient's private room
+    io.to(`user:${targetUserId}`).emit('receive_message', message);
+
+    res.status(201).json(message);
+  } catch (err) {
+    console.error('[Messages] Send REST error:', err);
+    res.status(err instanceof DatabaseUnavailableError ? 503 : 500).json({
+      error: err instanceof DatabaseUnavailableError ? err.message : 'Failed to store message'
+    });
   }
-
-  if (targetUserId === currentUserId) {
-    return res.status(400).json({ error: 'Cannot send message to yourself' });
-  }
-
-  const message: Message = {
-    id: 'msg_' + Date.now() + '_' + Math.random().toString(36).substring(2, 9),
-    from: currentUserId,
-    to: targetUserId,
-    participants: [currentUserId, targetUserId].sort(),
-    text: text.trim(),
-    createdAt: new Date().toISOString()
-  };
-
-  messagesCache.push(message);
-  await saveRecord('messages', 'id', message);
-
-  // Deliver via Socket.io to recipient's private room
-  io.to(`user:${targetUserId}`).emit('receive_message', message);
-
-  res.status(201).json(message);
 });
 
 // Start Server and Mount Vite (with HMR disabled in middleware mode)

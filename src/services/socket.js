@@ -1,6 +1,28 @@
 import { io } from 'socket.io-client';
 
-const API_BASE_URL = (import.meta.env.VITE_API_URL || '').trim().replace(/\/+$/, '');
+const DEFAULT_PROD_API_URL = 'https://campus-connect-api-8j4o.onrender.com';
+
+function resolveApiBaseUrl() {
+  const raw = (import.meta.env.VITE_API_URL || '')
+    .trim()
+    .replace(/^['"]|['"]$/g, '')
+    .replace(/\/+$/, '')
+    .replace(/\/api$/i, '');
+
+  if (raw) return raw;
+
+  if (
+    import.meta.env.PROD &&
+    typeof window !== 'undefined' &&
+    window.location.hostname.endsWith('.vercel.app')
+  ) {
+    return DEFAULT_PROD_API_URL;
+  }
+
+  return '';
+}
+
+const API_BASE_URL = resolveApiBaseUrl();
 const apiUrl = (path) => {
   const normalizedPath = path.startsWith('/') ? path : `/${path}`;
   return API_BASE_URL ? `${API_BASE_URL}${normalizedPath}` : normalizedPath;
@@ -104,6 +126,7 @@ export async function apiFetchMe(token) {
   if (!authToken) return null;
 
   const res = await fetch(apiUrl('/api/auth/me'), {
+    cache: 'no-store',
     headers: {
       'Authorization': `Bearer ${authToken}`
     }
@@ -248,21 +271,47 @@ export function sendSocketMessage(to, text, tempId) {
  * REST fallback to send message
  */
 export async function sendRestMessage(to, text) {
-  if (!currentToken) return null;
+  const token = currentToken || getStoredToken();
+  if (!token) {
+    throw new Error('Authentication required to send messages');
+  }
   const res = await fetch(apiUrl(`/api/messages/${to}`), {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${currentToken}`
+      'Authorization': `Bearer ${token}`
     },
     body: JSON.stringify({ text })
   });
 
+  const data = await parseJsonSafely(res);
   if (!res.ok) {
-    throw new Error('Failed to send message via REST API');
+    throw new Error(data?.error || 'Failed to send message via REST API');
   }
 
-  return await res.json();
+  return data;
+}
+
+/**
+ * Fetch all persistent messages involving current user
+ */
+export async function apiFetchMyMessages(user) {
+  const token = currentToken || await getAuthToken(user);
+  if (!token) return [];
+
+  const res = await fetch(apiUrl('/api/messages'), {
+    cache: 'no-store',
+    headers: {
+      'Authorization': `Bearer ${token}`
+    }
+  });
+
+  const data = await parseJsonSafely(res);
+  if (!res.ok) {
+    throw new Error(data?.error || `Failed to fetch messages: ${res.statusText}`);
+  }
+
+  return Array.isArray(data) ? data : [];
 }
 
 /**
@@ -274,16 +323,18 @@ export async function fetchConversationHistory(targetUserId, user) {
 
   try {
     const res = await fetch(apiUrl(`/api/messages/${targetUserId}`), {
+      cache: 'no-store',
       headers: {
         'Authorization': `Bearer ${token}`
       }
     });
 
+    const data = await parseJsonSafely(res);
     if (!res.ok) {
-      throw new Error(`Failed to fetch history: ${res.statusText}`);
+      throw new Error(data?.error || `Failed to fetch history: ${res.statusText}`);
     }
 
-    return await res.json();
+    return Array.isArray(data) ? data : [];
   } catch (err) {
     console.error('[Socket Client] Error fetching conversation history:', err);
     return [];
@@ -342,14 +393,15 @@ export async function apiFetchUsers(user) {
     headers['Authorization'] = `Bearer ${token}`;
   }
 
-  try {
-    const res = await fetch(apiUrl('/api/users'), { headers });
-    if (!res.ok) throw new Error('Failed to fetch users');
-    return await res.json();
-  } catch (err) {
-    console.error('[API Client] Error fetching users:', err);
-    return null;
+  const res = await fetch(apiUrl('/api/users'), {
+    cache: 'no-store',
+    headers
+  });
+  const data = await parseJsonSafely(res);
+  if (!res.ok) {
+    throw new Error(data?.error || 'Failed to fetch students from database');
   }
+  return Array.isArray(data) ? data : [];
 }
 
 /**
@@ -359,16 +411,15 @@ export async function apiFetchConnections(user) {
   const token = currentToken || await getAuthToken(user);
   if (!token) return [];
 
-  try {
-    const res = await fetch(apiUrl('/api/connections'), {
-      headers: { 'Authorization': `Bearer ${token}` }
-    });
-    if (!res.ok) throw new Error('Failed to fetch connections');
-    return await res.json();
-  } catch (err) {
-    console.error('[API Client] Error fetching connections:', err);
-    return [];
+  const res = await fetch(apiUrl('/api/connections'), {
+    cache: 'no-store',
+    headers: { 'Authorization': `Bearer ${token}` }
+  });
+  const data = await parseJsonSafely(res);
+  if (!res.ok) {
+    throw new Error(data?.error || 'Failed to fetch connections');
   }
+  return Array.isArray(data) ? data : [];
 }
 
 /**
@@ -376,7 +427,9 @@ export async function apiFetchConnections(user) {
  */
 export async function apiSendConnection(targetUserId, user) {
   const token = currentToken || await getAuthToken(user);
-  if (!token) return null;
+  if (!token) {
+    throw new Error('Authentication required to connect');
+  }
 
   const res = await fetch(apiUrl(`/api/connections/${targetUserId}`), {
     method: 'POST',
@@ -386,10 +439,11 @@ export async function apiSendConnection(targetUserId, user) {
     }
   });
 
+  const data = await parseJsonSafely(res);
   if (!res.ok) {
-    throw new Error('Failed to send connection request');
+    throw new Error(data?.error || 'Failed to send connection request');
   }
-  return await res.json();
+  return data;
 }
 
 /**
@@ -397,7 +451,9 @@ export async function apiSendConnection(targetUserId, user) {
  */
 export async function apiUpdateConnection(requestId, status, user) {
   const token = currentToken || await getAuthToken(user);
-  if (!token) return null;
+  if (!token) {
+    throw new Error('Authentication required to update connection');
+  }
 
   const res = await fetch(apiUrl(`/api/connections/${requestId}`), {
     method: 'PUT',
@@ -408,10 +464,11 @@ export async function apiUpdateConnection(requestId, status, user) {
     body: JSON.stringify({ status })
   });
 
+  const data = await parseJsonSafely(res);
   if (!res.ok) {
-    throw new Error('Failed to update connection request');
+    throw new Error(data?.error || 'Failed to update connection request');
   }
-  return await res.json();
+  return data;
 }
 
 /**
@@ -419,17 +476,20 @@ export async function apiUpdateConnection(requestId, status, user) {
  */
 export async function apiDeleteConnection(requestId, user) {
   const token = currentToken || await getAuthToken(user);
-  if (!token) return null;
+  if (!token) {
+    throw new Error('Authentication required to remove connection');
+  }
 
   const res = await fetch(apiUrl(`/api/connections/${requestId}`), {
     method: 'DELETE',
     headers: { 'Authorization': `Bearer ${token}` }
   });
 
+  const data = await parseJsonSafely(res);
   if (!res.ok) {
-    throw new Error('Failed to delete connection');
+    throw new Error(data?.error || 'Failed to delete connection');
   }
-  return await res.json();
+  return data;
 }
 
 /**
@@ -437,7 +497,9 @@ export async function apiDeleteConnection(requestId, user) {
  */
 export async function apiUpdateProfile(updatedData, user) {
   const token = currentToken || await getAuthToken(user);
-  if (!token) return null;
+  if (!token) {
+    throw new Error('Authentication required to update profile');
+  }
 
   const res = await fetch(apiUrl('/api/users/me'), {
     method: 'PUT',
@@ -448,10 +510,11 @@ export async function apiUpdateProfile(updatedData, user) {
     body: JSON.stringify(updatedData)
   });
 
+  const data = await parseJsonSafely(res);
   if (!res.ok) {
-    throw new Error('Failed to update profile via API');
+    throw new Error(data?.error || 'Failed to update profile via API');
   }
-  return await res.json();
+  return data;
 }
 
 /**
@@ -487,10 +550,12 @@ export async function apiFetchNotifications(user) {
 
   try {
     const res = await fetch(apiUrl('/api/notifications'), {
+      cache: 'no-store',
       headers: { 'Authorization': `Bearer ${token}` }
     });
-    if (!res.ok) throw new Error('Failed to fetch notifications');
-    return await res.json();
+    const data = await parseJsonSafely(res);
+    if (!res.ok) throw new Error(data?.error || 'Failed to fetch notifications');
+    return Array.isArray(data) ? data : [];
   } catch (err) {
     console.error('[API Client] Error fetching notifications:', err);
     return [];
@@ -509,8 +574,9 @@ export async function apiMarkNotificationRead(notificationId, user) {
       method: 'PATCH',
       headers: { 'Authorization': `Bearer ${token}` }
     });
-    if (!res.ok) throw new Error('Failed to mark notification read');
-    return await res.json();
+    const data = await parseJsonSafely(res);
+    if (!res.ok) throw new Error(data?.error || 'Failed to mark notification read');
+    return data;
   } catch (err) {
     console.error('[API Client] Error marking notification read:', err);
     return null;
@@ -529,8 +595,9 @@ export async function apiMarkAllNotificationsRead(user) {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${token}` }
     });
-    if (!res.ok) throw new Error('Failed to mark all notifications read');
-    return await res.json();
+    const data = await parseJsonSafely(res);
+    if (!res.ok) throw new Error(data?.error || 'Failed to mark all notifications read');
+    return data;
   } catch (err) {
     console.error('[API Client] Error marking all notifications read:', err);
     return null;

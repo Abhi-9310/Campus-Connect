@@ -20,6 +20,7 @@ import {
   getStoredToken,
   clearStoredTokens,
   apiFetchNotifications,
+  apiFetchMyMessages,
   apiMarkNotificationRead,
   apiMarkAllNotificationsRead,
   subscribeToNotifications,
@@ -83,12 +84,32 @@ export function AuthProvider({ children }) {
     }
   };
 
+  // Sync persisted messages for current user from database
+  const refreshMessages = async (user = currentUser) => {
+    if (!user) {
+      setMessages([]);
+      return;
+    }
+    try {
+      const data = await apiFetchMyMessages(user);
+      if (Array.isArray(data)) {
+        const sorted = [...data].sort(
+          (a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime()
+        );
+        setMessages(sorted);
+      }
+    } catch (err) {
+      console.warn('[AuthContext] Could not fetch messages:', err);
+    }
+  };
+
   // Restore active session cleanly from database on boot without unmounting modals later
   useEffect(() => {
     let cancelled = false;
 
     async function bootstrapSession() {
       try {
+        sessionStorage.removeItem('cc_user');
         const activeUid = sessionStorage.getItem('cc_active_uid');
         const token = getStoredToken(activeUid);
 
@@ -96,12 +117,12 @@ export function AuthProvider({ children }) {
           const verifiedUser = await apiFetchMe(token);
           if (!cancelled && verifiedUser && verifiedUser.uid) {
             sessionStorage.setItem('cc_active_uid', verifiedUser.uid);
-            sessionStorage.setItem('cc_user', JSON.stringify(verifiedUser));
             setCurrentUser(verifiedUser);
             setUserProfile(verifiedUser);
             await Promise.all([
               refreshUsers(verifiedUser),
-              refreshNotifications(verifiedUser)
+              refreshNotifications(verifiedUser),
+              refreshMessages(verifiedUser)
             ]);
             return;
           }
@@ -110,10 +131,10 @@ export function AuthProvider({ children }) {
         // No valid session: clear stale session markers and load public Discover profiles from DB
         clearStoredTokens(activeUid);
         sessionStorage.removeItem('cc_active_uid');
-        sessionStorage.removeItem('cc_user');
         if (!cancelled) {
           setCurrentUser(null);
           setUserProfile(null);
+          setMessages([]);
           await refreshUsers(null);
         }
       } catch (err) {
@@ -121,6 +142,7 @@ export function AuthProvider({ children }) {
         if (!cancelled) {
           setCurrentUser(null);
           setUserProfile(null);
+          setMessages([]);
           await refreshUsers(null);
         }
       } finally {
@@ -209,11 +231,19 @@ export function AuthProvider({ children }) {
     });
 
     const unsubUserUpdate = subscribeToUserUpdates((payload) => {
+      if (!payload?.uid) return;
+      const patch = {};
+      ['name', 'branch', 'year', 'bio', 'skills', 'avatarUrl', 'initials'].forEach((key) => {
+        if (payload[key] !== undefined) {
+          patch[key] = payload[key];
+        }
+      });
+
       if (currentUser && payload.uid === currentUser.uid) {
-        setCurrentUser(prev => prev ? ({ ...prev, avatarUrl: payload.avatarUrl }) : prev);
-        setUserProfile(prev => prev ? ({ ...prev, avatarUrl: payload.avatarUrl }) : prev);
+        setCurrentUser(prev => prev ? ({ ...prev, ...patch }) : prev);
+        setUserProfile(prev => prev ? ({ ...prev, ...patch }) : prev);
       }
-      setAllStudents(prev => prev.map(s => s.uid === payload.uid ? { ...s, avatarUrl: payload.avatarUrl } : s));
+      setAllStudents(prev => prev.map(s => s.uid === payload.uid ? { ...s, ...patch } : s));
     });
 
     return () => {
@@ -304,12 +334,13 @@ export function AuthProvider({ children }) {
     }
 
     sessionStorage.setItem('cc_active_uid', data.user.uid);
-    sessionStorage.setItem('cc_user', JSON.stringify(data.user));
+    sessionStorage.removeItem('cc_user');
     setCurrentUser(data.user);
     setUserProfile(data.user);
     await Promise.all([
       refreshUsers(data.user),
-      refreshNotifications(data.user)
+      refreshNotifications(data.user),
+      refreshMessages(data.user)
     ]);
     setAuthModalOpen(false);
     await resumePendingAction(data.user);
@@ -416,12 +447,13 @@ export function AuthProvider({ children }) {
   const updateUserProfile = async (updatedData) => {
     if (!currentUser) return;
     const updatedUser = await apiUpdateProfile(updatedData, currentUser);
-    const merged = updatedUser || { ...currentUser, ...updatedData, updatedAt: new Date().toISOString() };
-    setCurrentUser(merged);
-    setUserProfile(merged);
-    sessionStorage.setItem('cc_user', JSON.stringify(merged));
-    await refreshUsers(merged);
-    return merged;
+    if (!updatedUser || !updatedUser.uid) {
+      throw new Error('Profile update was not confirmed by the database');
+    }
+    setCurrentUser(updatedUser);
+    setUserProfile(updatedUser);
+    await refreshUsers(updatedUser);
+    return updatedUser;
   };
 
   const uploadAvatar = async (file) => {
@@ -430,7 +462,6 @@ export function AuthProvider({ children }) {
     if (res && res.user) {
       setCurrentUser(res.user);
       setUserProfile(res.user);
-      sessionStorage.setItem('cc_user', JSON.stringify(res.user));
       setAllStudents(prev => prev.map(s => s.uid === res.user.uid ? { ...s, avatarUrl: res.user.avatarUrl } : s));
     }
     return res;
@@ -442,7 +473,6 @@ export function AuthProvider({ children }) {
     if (res && res.user) {
       setCurrentUser(res.user);
       setUserProfile(res.user);
-      sessionStorage.setItem('cc_user', JSON.stringify(res.user));
       setAllStudents(prev => prev.map(s => s.uid === res.user.uid ? { ...s, avatarUrl: '' } : s));
     }
     return res;
